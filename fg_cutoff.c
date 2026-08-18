@@ -37,12 +37,11 @@
  *     kernel's power_supply_attrs[] table, not hard-coded as an ordinal.
  *   - Reads use probe_kernel_read, so a bad address returns -EFAULT, never a
  *     panic. SRAM is written via the exported fg_sram_write.
- *   - Low-temperature tier: cold raises cell impedance, so the loaded terminal
- *     voltage sags well below OCV and holding the warm floor throws away real
- *     charge. Below lt_enter_dc all three floors drop by lt_delta_mv (with
- *     hysteresis, which stock lacks). Works whether or not the driver runs its
- *     own qcom,cutoff-voltage-adjust-enable path; where it does, we simply win
- *     the race because we re-assert on every voltage read.
+ *   - Low-temperature tier: all three floors drop by lt_delta_mv while the
+ *     driver reports cold. WHEN that is, is mirrored from the driver's own
+ *     is_low_temp_flag -- no threshold of our own, so a kernel with no low-temp
+ *     policy (lmi) never enters the tier either. Where the driver does manage
+ *     cutoff we win the race by re-asserting on every voltage read.
  *   - Stock values are restored on unload.
  */
 
@@ -133,27 +132,34 @@ KPM_DESCRIPTION("Lower FG-Gen4 cutoff + empty + shutdown floor (lmi / Si-C tier)
  * Low-temperature tier.
  *
  * Cold raises cell impedance, so the LOADED terminal voltage sags far below
- * OCV. Holding the same floor in cold therefore throws away real charge. Stock
- * handles this by shifting its whole set down 200 mV below 15.0 C:
+ * OCV and holding the warm floor throws away real charge. Stock handles this by
+ * shifting its whole set down 200 mV when cold:
  *   cutoff 3400->3200, SHUTDOWN_DELAY_VOL 3300->3100, FVSS entry 3600->3400.
  *
- * We do the same, but by a SMALLER default step. The binding constraint in the
- * cold is not cell damage -- at these terminal voltages OCV is much higher, so
- * true depth-of-discharge stays modest -- it is system brown-out, because the
- * same impedance that justifies going lower also makes load spikes sag harder.
+ * WHEN it is cold is decided ENTIRELY by the driver: we mirror its
+ * is_low_temp_flag. That flag is only maintained where
+ * qcom,cutoff-voltage-adjust-enable is set (umi does, lmi does not), so on a
+ * device whose kernel has no low-temp policy we correctly never enter the tier
+ * either -- the module shifts the driver's floors down, it does not invent a
+ * policy the driver does not have. Deliberately no own threshold: the driver's
+ * is a compile-time #define that another tree may well have changed, and the
+ * target kernel need not be the one this was developed against.
+ *
+ * HOW FAR to drop is ours. The binding constraint in the cold is not cell
+ * damage -- at these terminal voltages OCV is much higher, so true
+ * depth-of-discharge stays modest -- it is system brown-out, because the same
+ * impedance that justifies going lower also makes load spikes sag harder.
  * Headroom over sys_min_volt_mv (2800 on lmi) at the shutdown floor:
- *     stock normal 500 mV | stock cold 300 mV | ours normal 350 mV
+ *     stock warm 500 mV | stock cold 300 mV | ours warm 350 mV
  *     ours cold at -100 => 250 mV   (default)
  *     ours cold at -150 => 200 mV   (aggressive)
  *     ours cold at -200 => 150 mV   (below what the OEM considered safe; avoid)
  *
  * Applied uniformly to all three floors so the cutoff->shutdown "hang at 1%"
- * window keeps its width. Tunable at load time with "lt=<mv>" / "lttemp=<dC>".
+ * window keeps its width. Tunable at load time with "lt=<mv>".
  */
 #define DEFAULT_LT_DELTA_MV 100    /* how far the whole set drops when cold   */
 #define LT_DELTA_MV_MAX     200
-#define DEFAULT_LT_ENTER_DC 150    /* deci-degrees C: cold below 15.0 C       */
-#define LT_HYST_DC          20     /* leave cold above enter + 2.0 C          */
 
 /*
  * POWER_SUPPLY_PROP_CAPACITY ordinal. Derived at runtime by name from the
@@ -216,14 +222,13 @@ typedef int  (*fg_sram_write_t)(void *fg, unsigned short address, unsigned char 
 typedef int  (*fg_sram_read_t)(void *fg, unsigned short address, unsigned char offset,
                                unsigned char *val, int len, int flags);
 typedef int  (*fg_get_batt_volt_t)(void *fg, int *val_uv);
-typedef int  (*fg_get_batt_temp_t)(void *fg, int *val_dc);
 
 static probe_kernel_read_t p_probe_kernel_read;
 static fg_sram_write_t     p_fg_sram_write;
 static fg_sram_read_t      p_fg_sram_read;          /* optional: anchor source */
 static void               *p_fg_get_battery_voltage; /* hook target + callable */
 static void               *p_fg_psy_get_property;    /* hook target            */
-static fg_get_batt_temp_t  p_fg_get_battery_temp;   /* optional: low-temp tier */
+static const void         *p_is_low_temp_flag;      /* driver's own cold verdict */
 
 /* ------------------------------------------------------------------ */
 /* State                                                              */
@@ -233,9 +238,7 @@ static int   target_cutoff_mv   = DEFAULT_CUTOFF_MV;
 static int   target_empty_mv    = DEFAULT_EMPTY_MV;
 static int   target_shutdown_mv = DEFAULT_SHUTDOWN_MV;
 static int   lt_delta_mv    = DEFAULT_LT_DELTA_MV;  /* cold-tier step, mV      */
-static int   lt_enter_dc    = DEFAULT_LT_ENTER_DC;  /* cold below this, deci-C */
-static int   in_low_temp;                           /* current tier            */
-static int   lt_poll_countdown;                     /* throttle temp reads     */
+static int   in_low_temp;                           /* mirrors driver's flag   */
 static int   orig_cutoff_mv     = -1;  /* stock values, captured on first apply */
 static int   orig_empty_mv      = -1;
 static int  *cutoff_field;             /* kernel VA of dt.cutoff_volt_mv         */
@@ -574,46 +577,48 @@ static void apply_from_chip(void *chip)
             eff_shutdown_mv(), field);
 }
 
-/*
- * Re-evaluate the cold tier. Returns 1 if the tier changed.
- *
- * Throttled: fg_gen4_get_battery_temp() does an SRAM read, and this runs off a
- * hot hook. Battery temperature has large thermal mass, so sampling every
- * LT_POLL_CALLS voltage reads is far more resolution than the effect needs.
- *
- * Hysteresis (LT_HYST_DC) is ours, not the driver's: stock flips at exactly
- * 15.0 C on a 10 s timer, so a battery sitting at the threshold makes it
- * oscillate. We would follow that oscillation with an SRAM rewrite each time.
- */
-#define LT_POLL_CALLS 16
-
-static int update_low_temp_tier(void *chip, int force)
+/* Read the driver's own bool. 1 byte; -1 if unavailable. */
+static int read_driver_cold_flag(int *out)
 {
-    int temp_dc = 0, was = in_low_temp;
+    unsigned char b = 0;
 
-    if (!p_fg_get_battery_temp)
-        return 0;
-
-    if (!force && --lt_poll_countdown > 0)
-        return 0;
-    lt_poll_countdown = LT_POLL_CALLS;
-
-    if (p_fg_get_battery_temp(chip, &temp_dc) != 0)
-        return 0;
-
-    if (in_low_temp)
-        in_low_temp = (temp_dc < lt_enter_dc + LT_HYST_DC);
-    else
-        in_low_temp = (temp_dc < lt_enter_dc);
-
-    if (in_low_temp != was) {
-        pr_info(LOG_PREFIX "temp %d.%d C -> %s tier: cutoff=%d empty=%d shutdown=%d mV\n",
-                temp_dc / 10, temp_dc < 0 ? -(temp_dc % 10) : temp_dc % 10,
-                in_low_temp ? "COLD" : "normal",
-                eff_cutoff_mv(), eff_empty_mv(), eff_shutdown_mv());
-        return 1;
-    }
+    if (!p_is_low_temp_flag || !p_probe_kernel_read)
+        return -1;
+    if (p_probe_kernel_read(&b, p_is_low_temp_flag, 1) != 0)
+        return -1;
+    *out = b ? 1 : 0;
     return 0;
+}
+
+/*
+ * Mirror the driver's cold verdict. Returns 1 if the tier changed.
+ *
+ * is_low_temp_flag is the driver's single source of truth for "cold": its own
+ * cutoff pair and its SHUTDOWN_DELAY_VOL_lOW_TEMP both key off it. Following it
+ * verbatim -- no threshold of our own, no hysteresis -- is what keeps us in
+ * step: a threshold or hysteresis on our side would only create windows where
+ * the driver says cold and we say warm, or the reverse.
+ *
+ * If the symbol is absent, or the driver never sets it (its low-temp path is
+ * gated on qcom,cutoff-voltage-adjust-enable, which lmi does not set), we stay
+ * in the warm tier forever -- which is exactly right: that kernel has no
+ * low-temp policy for us to shift.
+ */
+static int update_low_temp_tier(void)
+{
+    int flag = 0, was = in_low_temp;
+
+    if (read_driver_cold_flag(&flag) != 0)
+        return 0;
+
+    in_low_temp = flag;
+    if (in_low_temp == was)
+        return 0;
+
+    pr_info(LOG_PREFIX "driver is_low_temp_flag=%d -> %s tier: cutoff=%d empty=%d shutdown=%d mV\n",
+            flag, in_low_temp ? "COLD" : "normal",
+            eff_cutoff_mv(), eff_empty_mv(), eff_shutdown_mv());
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -624,24 +629,25 @@ static int update_low_temp_tier(void *chip, int force)
 static void before_get_voltage(hook_fargs2_t *args, void *udata)
 {
     void *chip = (void *)args->arg0;
-    int clobbered = 0, tier_changed = 0;
+    int clobbered = 0, tier_changed = 0, driver_wrote = 0;
 
     if (!chip)
         return;
 
     if (chip != chip_ptr || !cutoff_field) {
-        update_low_temp_tier(chip, 1);
+        update_low_temp_tier();
         apply_from_chip(chip);
         return;
     }
 
     /* A tier change makes the stored values stale -- treat it as a clobber so
      * both the C fields and SRAM are rewritten below. */
-    tier_changed = update_low_temp_tier(chip, 0);
+    tier_changed = update_low_temp_tier();
     if (tier_changed)
         clobbered = 1;
 
     if (*cutoff_field != eff_cutoff_mv()) {
+        driver_wrote = *cutoff_field;
         *cutoff_field = eff_cutoff_mv();
         clobbered = 1;
     }
@@ -661,9 +667,10 @@ static void before_get_voltage(hook_fargs2_t *args, void *udata)
     if (clobbered) {
         write_cutoff_sram(chip, eff_cutoff_mv(), 0);
         write_empty_sram(chip, eff_empty_mv(), 0);
-        if (!tier_changed && reassert_logs_left > 0) {
+        if (!tier_changed && driver_wrote && reassert_logs_left > 0) {
             reassert_logs_left--;
-            pr_info(LOG_PREFIX "driver overwrote dt block; re-asserted C fields + SRAM%s\n",
+            pr_info(LOG_PREFIX "driver wrote cutoff=%d mV; re-asserted %d mV (C field + SRAM)%s\n",
+                    driver_wrote, eff_cutoff_mv(),
                     reassert_logs_left ? "" : " (further notices suppressed)");
         }
     }
@@ -711,9 +718,10 @@ static void after_get_property(hook_fargs3_t *args, void *udata)
  *   "3250,3000,3150"      "3250,3000,3150,psp=44"      "psp=44"
  *
  * Low-temperature tier:
- *   "lt=<mv>"      how far all three floors drop when cold (0..200, default 100)
- *   "lttemp=<dC>"  cold threshold in deci-degrees C (default 150 = 15.0 C)
- *   e.g. "3250,3000,3150,lt=150"   "lt=0"  disables the cold tier entirely
+ *   "lt=<mv>"  how far all three floors drop while the driver reports cold
+ *              (0..200, default 100). "lt=0" disables the tier entirely.
+ *              WHEN it is cold is the driver's call, not ours -- see
+ *              update_low_temp_tier().
  */
 static int kw_is(const char *s, const char *kw)
 {
@@ -733,19 +741,6 @@ static void set_targets_from_args(const char *args)
     int idx = 0, v = 0, in = 0;
 
     for (; s && *s; s++) {
-        /* "lttemp=<deci-C>" must be tested before the "lt=" prefix. */
-        if (kw_is(s, "lttemp=")) {
-            int v = 0, got = 0, neg = 0;
-
-            s += 7;
-            if (*s == '-') { neg = 1; s++; }
-            for (; *s >= '0' && *s <= '9'; s++) { v = v * 10 + (*s - '0'); got = 1; }
-            if (got)
-                lt_enter_dc = clamp_i(neg ? -v : v, -200, 300);
-            if (!*s)
-                break;
-            continue;
-        }
         if (kw_is(s, "lt=")) {
             int v = 0, got = 0;
 
@@ -807,7 +802,7 @@ static long fg_cutoff_init(const char *args, const char *event, void *__user res
     p_fg_sram_read           = (fg_sram_read_t)kallsyms_lookup_name("fg_sram_read");
     p_fg_get_battery_voltage = (void *)kallsyms_lookup_name("fg_get_battery_voltage");
     p_fg_psy_get_property    = (void *)kallsyms_lookup_name("fg_psy_get_property");
-    p_fg_get_battery_temp    = (fg_get_batt_temp_t)kallsyms_lookup_name("fg_gen4_get_battery_temp");
+    p_is_low_temp_flag       = (const void *)kallsyms_lookup_name("is_low_temp_flag");
 
     pr_info(LOG_PREFIX "syms: pkr=%px sram_write=%px sram_read=%px get_voltage=%px get_property=%px\n",
             p_probe_kernel_read, p_fg_sram_write, p_fg_sram_read,
@@ -821,12 +816,10 @@ static long fg_cutoff_init(const char *args, const char *event, void *__user res
         pr_info(LOG_PREFIX "fg_sram_write not found; C-field only\n");
     if (!p_fg_sram_read)
         pr_info(LOG_PREFIX "fg_sram_read not found; dt scan falls back to shape+uniqueness\n");
-    if (!p_fg_get_battery_temp)
-        pr_info(LOG_PREFIX "fg_gen4_get_battery_temp not found; low-temp tier disabled\n");
-    else
-        pr_info(LOG_PREFIX "low-temp tier: -%d mV below %d.%d C (hyst %d.%d C)\n",
-                lt_delta_mv, lt_enter_dc / 10, lt_enter_dc % 10,
-                LT_HYST_DC / 10, LT_HYST_DC % 10);
+    pr_info(LOG_PREFIX "low-temp tier: -%d mV, mirroring is_low_temp_flag=%px (%s)\n",
+            lt_delta_mv, p_is_low_temp_flag,
+            p_is_low_temp_flag ? "driver decides when cold"
+                               : "absent -- driver has no low-temp policy, tier stays off");
 
     /* CAPACITY ordinal: explicit arg > by-name lookup > compiled fallback. */
     if (psp_from_arg >= 0) {
