@@ -59,6 +59,61 @@ That same hook also **masks a premature rapid-SOC trip** (which forces
 the effective floor is 3150 mV regardless of when rapid latches, which is why
 lowering `VBAT_CRITICAL_LOW_THR` is unnecessary and that macro is left at stock.
 
+## Low-temperature tier
+
+Cold raises cell impedance, so the **loaded** terminal voltage sags well below
+OCV. Holding the warm floor in the cold therefore throws away real charge. Stock
+already handles this — below **15.0 °C** it shifts its whole set down 200 mV:
+
+| | warm | cold (< 15.0 °C) |
+|---|---|---|
+| `cutoff_volt_mv` | 3400 | 3200 |
+| `SHUTDOWN_DELAY_VOL` | 3300 | 3100 |
+| FVSS entry (`vbatt_scale`) | 3600 | 3400 |
+
+The KPM does the same, but by a **smaller default step (−100 mV)**, applied
+uniformly to all three of its floors so the cutoff→shutdown "hang at 1%" window
+keeps its width:
+
+| | warm | cold (default `lt=100`) |
+|---|---|---|
+| cutoff | 3250 | **3150** |
+| empty | 3000 | **2900** |
+| shutdown floor | 3150 | **3050** |
+
+**Why not simply copy stock's −200 mV.** In the cold the binding constraint is
+not cell damage — at these terminal voltages OCV is much higher, so true
+depth-of-discharge stays modest — it is **system brown-out**, because the same
+impedance that justifies going lower also makes load spikes sag harder. What
+matters is headroom above `sys_min_volt_mv` (2800 mV on `lmi`) at the shutdown
+floor:
+
+| | headroom over sys_min |
+|---|---|
+| stock warm 3300 | 500 mV |
+| stock cold 3100 | 300 mV |
+| ours warm 3150 | 350 mV |
+| ours cold `lt=100` → 3050 | **250 mV** |
+| ours cold `lt=150` → 3000 | 200 mV (aggressive) |
+| ours cold `lt=200` → 2950 | 150 mV — half the OEM's cold margin, avoid |
+
+Si/C is a reason to keep *more* margin, not less: SiOx-blended anodes have
+higher impedance and worse cold behaviour than graphite, so they sag harder
+exactly when you are closest to the floor. And the tail steepens near empty, so
+the extra 100 mV buys less charge than the number suggests.
+
+The tier is applied **whether or not** the driver runs its own
+`qcom,cutoff-voltage-adjust-enable` path (`umi` sets it, `lmi` does not). Where
+the driver does run it, the KPM wins the race simply by re-asserting on every
+voltage read — far more often than the driver's 10 s monitor tick — and
+re-asserts SRAM too, not just the C field. Unlike stock, the KPM applies
+**hysteresis** (leave the cold tier only above 17.0 °C); stock flips at exactly
+15.0 °C on a timer, so a battery resting at the threshold makes it oscillate.
+
+Battery temperature comes from `fg_gen4_get_battery_temp` (deci-degrees C),
+sampled at most once every 16 voltage reads. If that symbol is missing the tier
+is disabled and the warm floors are used throughout.
+
 ## How it works (device-independent)
 
 KPMs run in kernel space and can inline-hook kernel functions. This module
@@ -190,6 +245,11 @@ kpm control battery-fg-cutoff "3250,3000,3150"
 # force the CAPACITY ordinal if the by-name lookup ever fails on your tree
 kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,psp=44"
 
+# low-temperature tier: step (mV, 0-200) and threshold (deci-degrees C)
+kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=150"     # aggressive
+kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=0"       # disable
+kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lttemp=100" # cold below 10.0 C
+
 # unload (restores stock cutoff 3400 / empty 3100; shutdown hook removed)
 kpm unload battery-fg-cutoff
 ```
@@ -252,6 +312,10 @@ build:
   graphite) profile run further down the curve; it does **not** correct the
   percentage curve shape for a Si/C cell. For accurate mid-range SOC you still
   need a matching `fg-profile-data`.
+- **The cold tier is the least validated part.** The right step depends on your
+  cell's actual DCIR at temperature, which varies by pack. Validate `lt=` at the
+  coldest temperature you care about *under load* before trusting it; the
+  failure mode is a brown-out reboot, not a clean shutdown.
 - **Safety.** Do not set the floor below the cell's real spec or the PMIC UVLO.
   Over-discharge damages cells; too low a floor risks brown-out/reboot under
   load (the cell sags below system-min). Validate the aggressive end on-device
@@ -268,7 +332,7 @@ GPL-2.0-or-later (matches the Linux kernel and KernelPatch).
 
 # 简体中文
 
-[English](#battery-fg-cutoffkpm)
+[English](#about-this-kpm)
 
 一个 [SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra) / [KernelPatch](https://github.com/bmax121/KernelPatch)
 的 **KPM**（Kernel Patch Module），用于降低高通 **QPNP FG-Gen4** 电量计的放电**地板**
@@ -313,6 +377,50 @@ SRAM 锚点——同时 KPM 也写 SRAM，使改动立即生效）。
 同一个 hook 还**掩盖了 rapid-SOC 的提前触发**（它会强制 `msoc→0`）：报告会一直保持 1%，直到 vbatt
 真正跌破地板。所以无论 rapid 何时锁存，有效地板都是 3150 mV，这也是为什么无需降低
 `VBAT_CRITICAL_LOW_THR`，该宏保持原厂值。
+
+## 低温档位
+
+低温会抬高电芯内阻，**带载**端电压因此远低于 OCV。此时若仍守着常温地板，就等于白白丢掉真实电量。
+原厂本身就处理了这一点——低于 **15.0℃** 时整套下移 200 mV：
+
+| | 常温 | 低温（< 15.0℃） |
+|---|---|---|
+| `cutoff_volt_mv` | 3400 | 3200 |
+| `SHUTDOWN_DELAY_VOL` | 3300 | 3100 |
+| FVSS 进入阈值（`vbatt_scale`） | 3600 | 3400 |
+
+本 KPM 做同样的事，但**默认步长更小（−100 mV）**，并且三个地板统一下移，
+使 cutoff→shutdown 的「卡在 1%」窗口宽度保持不变：
+
+| | 常温 | 低温（默认 `lt=100`） |
+|---|---|---|
+| cutoff | 3250 | **3150** |
+| empty | 3000 | **2900** |
+| 关机地板 | 3150 | **3050** |
+
+**为什么不直接照抄原厂的 −200 mV。** 低温下真正的约束不是电芯损伤——这种端电压下 OCV 高得多，
+真实放电深度其实不大——而是**系统掉电重启**：正是那个「值得往下探」的内阻，同时让负载尖峰塌得更狠。
+关键指标是关机地板相对 `sys_min_volt_mv`（lmi 上是 2800 mV）的余量：
+
+| | 相对 sys_min 的余量 |
+|---|---|
+| 原厂常温 3300 | 500 mV |
+| 原厂低温 3100 | 300 mV |
+| 本模块常温 3150 | 350 mV |
+| 本模块低温 `lt=100` → 3050 | **250 mV** |
+| 本模块低温 `lt=150` → 3000 | 200 mV（激进） |
+| 本模块低温 `lt=200` → 2950 | 150 mV——只有原厂低温余量的一半，不建议 |
+
+硅碳恰恰是**该多留余量**而非少留的理由：掺 SiOx 的负极内阻更高、低温表现比石墨更差，
+也就是说你最接近地板时它塌得最狠。而且尾段曲线会变陡，多下探这 100 mV 拿到的电量比数字看上去要少。
+
+无论驱动自身的 `qcom,cutoff-voltage-adjust-enable` 是否生效（umi 有、lmi 没有），这个档位**都会应用**。
+在驱动也会改的机型上，KPM 靠「每次读电压都重新写回」赢下这场竞争——频率远高于驱动 10 秒一次的
+monitor tick——而且连 SRAM 一起写回，不只是 C 字段。与原厂不同，KPM 带**滞回**
+（要高于 17.0℃ 才退出低温档）；原厂在定时器里按 15.0℃ 硬翻转，电池温度正好卡在阈值上时会来回抖。
+
+电池温度取自 `fg_gen4_get_battery_temp`（单位为 0.1℃），最多每 16 次电压读取采样一次。
+若该符号不存在，则关闭低温档、全程使用常温地板。
 
 ## 工作原理（与机型无关）
 
@@ -426,6 +534,11 @@ kpm control battery-fg-cutoff "3250,3000,3150"
 # 万一按名字查找在你的树上失败，可强制指定 CAPACITY 序号
 kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,psp=44"
 
+# 低温档位：步长（mV，0-200）与阈值（0.1℃）
+kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=150"     # 激进
+kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=0"       # 关闭低温档
+kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lttemp=100" # 低于 10.0℃ 算低温
+
 # 卸载（恢复原厂 cutoff 3400 / empty 3100；移除关机 hook）
 kpm unload battery-fg-cutoff
 ```
@@ -477,6 +590,8 @@ dmesg | grep fg-cutoff-kpm
   斜率/cutoff-current，而这会在充电时自恢复。）
 - **这不是电池 profile。** 降低地板让现有的（4700 mAh 石墨）profile 沿曲线跑得更深；它**不会**
   为硅碳电芯修正百分比曲线的形状。要获得准确的中段 SOC，仍需一份匹配的 `fg-profile-data`。
+- **低温档是验证最少的部分。** 合适的步长取决于你这颗电芯在对应温度下的真实 DCIR，各家电池不同。
+  在你关心的最低温度下**带载**实测验证过再信任 `lt=`；失败模式是掉电重启，而不是干净关机。
 - **安全。** 不要把地板设到低于电芯真实规格或 PMIC UVLO。过放会损伤电芯；地板过低有在负载下
   掉压/重启的风险（电芯被拉到系统最低电压以下）。请在设备上以高负载和低温验证激进的下限。
   限幅地板：cutoff 2800、empty 2500 mV。
