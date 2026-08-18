@@ -37,6 +37,12 @@
  *     kernel's power_supply_attrs[] table, not hard-coded as an ordinal.
  *   - Reads use probe_kernel_read, so a bad address returns -EFAULT, never a
  *     panic. SRAM is written via the exported fg_sram_write.
+ *   - Low-temperature tier: cold raises cell impedance, so the loaded terminal
+ *     voltage sags well below OCV and holding the warm floor throws away real
+ *     charge. Below lt_enter_dc all three floors drop by lt_delta_mv (with
+ *     hysteresis, which stock lacks). Works whether or not the driver runs its
+ *     own qcom,cutoff-voltage-adjust-enable path; where it does, we simply win
+ *     the race because we re-assert on every voltage read.
  *   - Stock values are restored on unload.
  */
 
@@ -102,7 +108,7 @@ static int fmt_msg(char *buf, int size, const char *fmt, ...)
 }
 
 KPM_NAME("battery-fg-cutoff");
-KPM_VERSION("1.4.0");
+KPM_VERSION("1.5.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("battery-fg-fix-kpm");
 KPM_DESCRIPTION("Lower FG-Gen4 cutoff + empty + shutdown floor (lmi / Si-C tier)");
@@ -122,6 +128,32 @@ KPM_DESCRIPTION("Lower FG-Gen4 cutoff + empty + shutdown floor (lmi / Si-C tier)
 #define DEFAULT_SHUTDOWN_MV 3150   /* effective shutdown floor (hang-at-1% end) */
 #define SHUTDOWN_MV_MIN     2800
 #define SHUTDOWN_MV_MAX     3300
+
+/*
+ * Low-temperature tier.
+ *
+ * Cold raises cell impedance, so the LOADED terminal voltage sags far below
+ * OCV. Holding the same floor in cold therefore throws away real charge. Stock
+ * handles this by shifting its whole set down 200 mV below 15.0 C:
+ *   cutoff 3400->3200, SHUTDOWN_DELAY_VOL 3300->3100, FVSS entry 3600->3400.
+ *
+ * We do the same, but by a SMALLER default step. The binding constraint in the
+ * cold is not cell damage -- at these terminal voltages OCV is much higher, so
+ * true depth-of-discharge stays modest -- it is system brown-out, because the
+ * same impedance that justifies going lower also makes load spikes sag harder.
+ * Headroom over sys_min_volt_mv (2800 on lmi) at the shutdown floor:
+ *     stock normal 500 mV | stock cold 300 mV | ours normal 350 mV
+ *     ours cold at -100 => 250 mV   (default)
+ *     ours cold at -150 => 200 mV   (aggressive)
+ *     ours cold at -200 => 150 mV   (below what the OEM considered safe; avoid)
+ *
+ * Applied uniformly to all three floors so the cutoff->shutdown "hang at 1%"
+ * window keeps its width. Tunable at load time with "lt=<mv>" / "lttemp=<dC>".
+ */
+#define DEFAULT_LT_DELTA_MV 100    /* how far the whole set drops when cold   */
+#define LT_DELTA_MV_MAX     200
+#define DEFAULT_LT_ENTER_DC 150    /* deci-degrees C: cold below 15.0 C       */
+#define LT_HYST_DC          20     /* leave cold above enter + 2.0 C          */
 
 /*
  * POWER_SUPPLY_PROP_CAPACITY ordinal. Derived at runtime by name from the
@@ -184,12 +216,14 @@ typedef int  (*fg_sram_write_t)(void *fg, unsigned short address, unsigned char 
 typedef int  (*fg_sram_read_t)(void *fg, unsigned short address, unsigned char offset,
                                unsigned char *val, int len, int flags);
 typedef int  (*fg_get_batt_volt_t)(void *fg, int *val_uv);
+typedef int  (*fg_get_batt_temp_t)(void *fg, int *val_dc);
 
 static probe_kernel_read_t p_probe_kernel_read;
 static fg_sram_write_t     p_fg_sram_write;
 static fg_sram_read_t      p_fg_sram_read;          /* optional: anchor source */
 static void               *p_fg_get_battery_voltage; /* hook target + callable */
 static void               *p_fg_psy_get_property;    /* hook target            */
+static fg_get_batt_temp_t  p_fg_get_battery_temp;   /* optional: low-temp tier */
 
 /* ------------------------------------------------------------------ */
 /* State                                                              */
@@ -198,6 +232,10 @@ static void               *p_fg_psy_get_property;    /* hook target            *
 static int   target_cutoff_mv   = DEFAULT_CUTOFF_MV;
 static int   target_empty_mv    = DEFAULT_EMPTY_MV;
 static int   target_shutdown_mv = DEFAULT_SHUTDOWN_MV;
+static int   lt_delta_mv    = DEFAULT_LT_DELTA_MV;  /* cold-tier step, mV      */
+static int   lt_enter_dc    = DEFAULT_LT_ENTER_DC;  /* cold below this, deci-C */
+static int   in_low_temp;                           /* current tier            */
+static int   lt_poll_countdown;                     /* throttle temp reads     */
 static int   orig_cutoff_mv     = -1;  /* stock values, captured on first apply */
 static int   orig_empty_mv      = -1;
 static int  *cutoff_field;             /* kernel VA of dt.cutoff_volt_mv         */
@@ -206,6 +244,7 @@ static void *chip_ptr;                 /* cached chip == fg base; "located" gate
 static int   psp_capacity  = -1;       /* resolved at init (name lookup / arg)   */
 static int   psp_from_arg  = -1;       /* "psp=<n>" override, -1 = unset         */
 
+static int   reassert_logs_left = 3;    /* driver-overwrote-us notices          */
 static int   diag_dumps_left = 3;       /* one-shot memory dumps on scan failure */
 
 /* ------------------------------------------------------------------ */
@@ -215,6 +254,29 @@ static int   diag_dumps_left = 3;       /* one-shot memory dumps on scan failure
 static inline int clamp_i(int v, int lo, int hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/*
+ * Effective floors = configured targets, shifted down by lt_delta_mv while the
+ * cold tier is active. Clamped, so a large "lt=" can never punch through the
+ * absolute minimums.
+ */
+static int eff_cutoff_mv(void)
+{
+    return clamp_i(target_cutoff_mv - (in_low_temp ? lt_delta_mv : 0),
+                   CUTOFF_MV_MIN, CUTOFF_MV_MAX);
+}
+
+static int eff_empty_mv(void)
+{
+    return clamp_i(target_empty_mv - (in_low_temp ? lt_delta_mv : 0),
+                   EMPTY_MV_MIN, EMPTY_MV_MAX);
+}
+
+static int eff_shutdown_mv(void)
+{
+    return clamp_i(target_shutdown_mv - (in_low_temp ? lt_delta_mv : 0),
+                   SHUTDOWN_MV_MIN, SHUTDOWN_MV_MAX);
 }
 
 static int safe_read_ints(const void *src, int *dst, int n)
@@ -456,7 +518,7 @@ static int sram_write(void *fg, int word, int byte, unsigned char *buf, int len)
                            buf, len, FG_IMA_DEFAULT);
 }
 
-static void write_cutoff_sram(void *fg, int mv)
+static void write_cutoff_sram(void *fg, int mv, int log)
 {
     unsigned char buf[CUTOFF_VOLT_LEN];
     int rc;
@@ -464,11 +526,12 @@ static void write_cutoff_sram(void *fg, int mv)
     encode_volt(mv, buf, CUTOFF_VOLT_LEN, CUTOFF_VOLT_NUMRTR,
                 CUTOFF_VOLT_DENMTR, CUTOFF_VOLT_VOFF);
     rc = sram_write(fg, CUTOFF_VOLT_WORD, CUTOFF_VOLT_BYTE, buf, CUTOFF_VOLT_LEN);
-    pr_info(LOG_PREFIX "SRAM CUTOFF_VOLT <- %d mV (raw %02x %02x) rc=%d\n",
-            mv, buf[0], buf[1], rc);
+    if (log)
+        pr_info(LOG_PREFIX "SRAM CUTOFF_VOLT <- %d mV (raw %02x %02x) rc=%d\n",
+                mv, buf[0], buf[1], rc);
 }
 
-static void write_empty_sram(void *fg, int mv)
+static void write_empty_sram(void *fg, int mv, int log)
 {
     unsigned char buf[VBATT_LOW_LEN];
     int rc;
@@ -476,8 +539,9 @@ static void write_empty_sram(void *fg, int mv)
     encode_volt(mv, buf, VBATT_LOW_LEN, VBATT_LOW_NUMRTR,
                 VBATT_LOW_DENMTR, VBATT_LOW_VOFF);
     rc = sram_write(fg, VBATT_LOW_WORD, VBATT_LOW_BYTE, buf, VBATT_LOW_LEN);
-    pr_info(LOG_PREFIX "SRAM VBATT_LOW  <- %d mV (raw %02x) rc=%d\n",
-            mv, buf[0], rc);
+    if (log)
+        pr_info(LOG_PREFIX "SRAM VBATT_LOW  <- %d mV (raw %02x) rc=%d\n",
+                mv, buf[0], rc);
 }
 
 static void apply_from_chip(void *chip)
@@ -500,14 +564,56 @@ static void apply_from_chip(void *chip)
     if (orig_empty_mv < 0)
         orig_empty_mv = *empty_field;
 
-    *cutoff_field = target_cutoff_mv;
-    *empty_field  = target_empty_mv;
-    write_cutoff_sram(chip, target_cutoff_mv);
-    write_empty_sram(chip, target_empty_mv);
+    *cutoff_field = eff_cutoff_mv();
+    *empty_field  = eff_empty_mv();
+    write_cutoff_sram(chip, eff_cutoff_mv(), 1);
+    write_empty_sram(chip, eff_empty_mv(), 1);
 
     pr_info(LOG_PREFIX "applied: cutoff %d->%d, empty %d->%d, shutdown floor %d mV (dt @ %px)\n",
-            orig_cutoff_mv, target_cutoff_mv, orig_empty_mv, target_empty_mv,
-            target_shutdown_mv, field);
+            orig_cutoff_mv, eff_cutoff_mv(), orig_empty_mv, eff_empty_mv(),
+            eff_shutdown_mv(), field);
+}
+
+/*
+ * Re-evaluate the cold tier. Returns 1 if the tier changed.
+ *
+ * Throttled: fg_gen4_get_battery_temp() does an SRAM read, and this runs off a
+ * hot hook. Battery temperature has large thermal mass, so sampling every
+ * LT_POLL_CALLS voltage reads is far more resolution than the effect needs.
+ *
+ * Hysteresis (LT_HYST_DC) is ours, not the driver's: stock flips at exactly
+ * 15.0 C on a 10 s timer, so a battery sitting at the threshold makes it
+ * oscillate. We would follow that oscillation with an SRAM rewrite each time.
+ */
+#define LT_POLL_CALLS 16
+
+static int update_low_temp_tier(void *chip, int force)
+{
+    int temp_dc = 0, was = in_low_temp;
+
+    if (!p_fg_get_battery_temp)
+        return 0;
+
+    if (!force && --lt_poll_countdown > 0)
+        return 0;
+    lt_poll_countdown = LT_POLL_CALLS;
+
+    if (p_fg_get_battery_temp(chip, &temp_dc) != 0)
+        return 0;
+
+    if (in_low_temp)
+        in_low_temp = (temp_dc < lt_enter_dc + LT_HYST_DC);
+    else
+        in_low_temp = (temp_dc < lt_enter_dc);
+
+    if (in_low_temp != was) {
+        pr_info(LOG_PREFIX "temp %d.%d C -> %s tier: cutoff=%d empty=%d shutdown=%d mV\n",
+                temp_dc / 10, temp_dc < 0 ? -(temp_dc % 10) : temp_dc % 10,
+                in_low_temp ? "COLD" : "normal",
+                eff_cutoff_mv(), eff_empty_mv(), eff_shutdown_mv());
+        return 1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -518,19 +624,49 @@ static void apply_from_chip(void *chip)
 static void before_get_voltage(hook_fargs2_t *args, void *udata)
 {
     void *chip = (void *)args->arg0;
+    int clobbered = 0, tier_changed = 0;
 
     if (!chip)
         return;
 
     if (chip != chip_ptr || !cutoff_field) {
+        update_low_temp_tier(chip, 1);
         apply_from_chip(chip);
         return;
     }
 
-    if (*cutoff_field != target_cutoff_mv)
-        *cutoff_field = target_cutoff_mv;
-    if (empty_field && *empty_field != target_empty_mv)
-        *empty_field = target_empty_mv;
+    /* A tier change makes the stored values stale -- treat it as a clobber so
+     * both the C fields and SRAM are rewritten below. */
+    tier_changed = update_low_temp_tier(chip, 0);
+    if (tier_changed)
+        clobbered = 1;
+
+    if (*cutoff_field != eff_cutoff_mv()) {
+        *cutoff_field = eff_cutoff_mv();
+        clobbered = 1;
+    }
+    if (empty_field && *empty_field != eff_empty_mv()) {
+        *empty_field = eff_empty_mv();
+        clobbered = 1;
+    }
+
+    /*
+     * The driver overwrote the dt block. On trees that set
+     * qcom,cutoff-voltage-adjust-enable (umi does; lmi does not),
+     * soc_monitor_work() rewrites dt.cutoff_volt_mv every 10 s AND reprograms
+     * SRAM CUTOFF_VOLT via fg_dynamic_set_cutoff_voltage(). Restoring the C
+     * field alone would leave the hardware msoc=0% anchor at the stock value,
+     * so re-assert SRAM as well. Quiet: this can repeat every monitor tick.
+     */
+    if (clobbered) {
+        write_cutoff_sram(chip, eff_cutoff_mv(), 0);
+        write_empty_sram(chip, eff_empty_mv(), 0);
+        if (!tier_changed && reassert_logs_left > 0) {
+            reassert_logs_left--;
+            pr_info(LOG_PREFIX "driver overwrote dt block; re-asserted C fields + SRAM%s\n",
+                    reassert_logs_left ? "" : " (further notices suppressed)");
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -559,7 +695,7 @@ static void after_get_property(hook_fargs3_t *args, void *udata)
      * the shutdown point down from the stock 3300 mV to target_shutdown_mv.
      * This also masks a premature rapid-SOC-forced 0% for the same window. */
     get_v = (fg_get_batt_volt_t)p_fg_get_battery_voltage;
-    if (get_v(chip_ptr, &vbatt_uv) == 0 && vbatt_uv > target_shutdown_mv * 1000)
+    if (get_v(chip_ptr, &vbatt_uv) == 0 && vbatt_uv > eff_shutdown_mv() * 1000)
         *pintval = 1;
 }
 
@@ -573,7 +709,23 @@ static void after_get_property(hook_fargs3_t *args, void *udata)
  * that forces the POWER_SUPPLY_PROP_CAPACITY ordinal when the by-name lookup
  * cannot work on an unusual tree. Order and separators are free-form:
  *   "3250,3000,3150"      "3250,3000,3150,psp=44"      "psp=44"
+ *
+ * Low-temperature tier:
+ *   "lt=<mv>"      how far all three floors drop when cold (0..200, default 100)
+ *   "lttemp=<dC>"  cold threshold in deci-degrees C (default 150 = 15.0 C)
+ *   e.g. "3250,3000,3150,lt=150"   "lt=0"  disables the cold tier entirely
  */
+static int kw_is(const char *s, const char *kw)
+{
+    for (; *kw; s++, kw++) {
+        char c = (*s >= 'A' && *s <= 'Z') ? (char)(*s + 32) : *s;
+
+        if (c != *kw)
+            return 0;
+    }
+    return 1;
+}
+
 static void set_targets_from_args(const char *args)
 {
     const char *s = args;
@@ -581,6 +733,30 @@ static void set_targets_from_args(const char *args)
     int idx = 0, v = 0, in = 0;
 
     for (; s && *s; s++) {
+        /* "lttemp=<deci-C>" must be tested before the "lt=" prefix. */
+        if (kw_is(s, "lttemp=")) {
+            int v = 0, got = 0, neg = 0;
+
+            s += 7;
+            if (*s == '-') { neg = 1; s++; }
+            for (; *s >= '0' && *s <= '9'; s++) { v = v * 10 + (*s - '0'); got = 1; }
+            if (got)
+                lt_enter_dc = clamp_i(neg ? -v : v, -200, 300);
+            if (!*s)
+                break;
+            continue;
+        }
+        if (kw_is(s, "lt=")) {
+            int v = 0, got = 0;
+
+            s += 3;
+            for (; *s >= '0' && *s <= '9'; s++) { v = v * 10 + (*s - '0'); got = 1; }
+            if (got)
+                lt_delta_mv = clamp_i(v, 0, LT_DELTA_MV_MAX);
+            if (!*s)
+                break;
+            continue;
+        }
         if ((s[0] == 'p' || s[0] == 'P') && (s[1] == 's' || s[1] == 'S') &&
             (s[2] == 'p' || s[2] == 'P') && s[3] == '=') {
             int pv = 0, got = 0;
@@ -631,6 +807,7 @@ static long fg_cutoff_init(const char *args, const char *event, void *__user res
     p_fg_sram_read           = (fg_sram_read_t)kallsyms_lookup_name("fg_sram_read");
     p_fg_get_battery_voltage = (void *)kallsyms_lookup_name("fg_get_battery_voltage");
     p_fg_psy_get_property    = (void *)kallsyms_lookup_name("fg_psy_get_property");
+    p_fg_get_battery_temp    = (fg_get_batt_temp_t)kallsyms_lookup_name("fg_gen4_get_battery_temp");
 
     pr_info(LOG_PREFIX "syms: pkr=%px sram_write=%px sram_read=%px get_voltage=%px get_property=%px\n",
             p_probe_kernel_read, p_fg_sram_write, p_fg_sram_read,
@@ -644,6 +821,12 @@ static long fg_cutoff_init(const char *args, const char *event, void *__user res
         pr_info(LOG_PREFIX "fg_sram_write not found; C-field only\n");
     if (!p_fg_sram_read)
         pr_info(LOG_PREFIX "fg_sram_read not found; dt scan falls back to shape+uniqueness\n");
+    if (!p_fg_get_battery_temp)
+        pr_info(LOG_PREFIX "fg_gen4_get_battery_temp not found; low-temp tier disabled\n");
+    else
+        pr_info(LOG_PREFIX "low-temp tier: -%d mV below %d.%d C (hyst %d.%d C)\n",
+                lt_delta_mv, lt_enter_dc / 10, lt_enter_dc % 10,
+                LT_HYST_DC / 10, LT_HYST_DC % 10);
 
     /* CAPACITY ordinal: explicit arg > by-name lookup > compiled fallback. */
     if (psp_from_arg >= 0) {
@@ -690,19 +873,19 @@ static long fg_cutoff_control0(const char *args, char *__user out_msg, int outle
     set_targets_from_args(args);
 
     if (cutoff_field && chip_ptr) {
-        *cutoff_field = target_cutoff_mv;
+        *cutoff_field = eff_cutoff_mv();
         if (empty_field)
-            *empty_field = target_empty_mv;
-        write_cutoff_sram(chip_ptr, target_cutoff_mv);
-        write_empty_sram(chip_ptr, target_empty_mv);
+            *empty_field = eff_empty_mv();
+        write_cutoff_sram(chip_ptr, eff_cutoff_mv(), 1);
+        write_empty_sram(chip_ptr, eff_empty_mv(), 1);
         len = fmt_msg(msg, (int)sizeof(msg),
                       "cutoff=%d empty=%d shutdown=%d mV live (stock %d/%d)\n",
-                      target_cutoff_mv, target_empty_mv, target_shutdown_mv,
+                      eff_cutoff_mv(), eff_empty_mv(), eff_shutdown_mv(),
                       orig_cutoff_mv, orig_empty_mv);
     } else {
         len = fmt_msg(msg, (int)sizeof(msg),
                       "cutoff=%d empty=%d shutdown=%d mV queued (not yet located)\n",
-                      target_cutoff_mv, target_empty_mv, target_shutdown_mv);
+                      eff_cutoff_mv(), eff_empty_mv(), eff_shutdown_mv());
     }
 
     pr_info(LOG_PREFIX "%s", msg);
@@ -721,9 +904,9 @@ static long fg_cutoff_exit(void *__user reserved)
         if (empty_field && orig_empty_mv > 0)
             *empty_field = orig_empty_mv;
         if (chip_ptr) {
-            write_cutoff_sram(chip_ptr, orig_cutoff_mv);
+            write_cutoff_sram(chip_ptr, orig_cutoff_mv, 1);
             if (orig_empty_mv > 0)
-                write_empty_sram(chip_ptr, orig_empty_mv);
+                write_empty_sram(chip_ptr, orig_empty_mv, 1);
         }
         pr_info(LOG_PREFIX "restored cutoff=%d empty=%d mV\n",
                 orig_cutoff_mv, orig_empty_mv);
