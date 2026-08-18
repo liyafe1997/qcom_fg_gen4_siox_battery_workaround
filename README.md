@@ -75,7 +75,7 @@ The KPM does the same, but by a **smaller default step (−100 mV)**, applied
 uniformly to all three of its floors so the cutoff→shutdown "hang at 1%" window
 keeps its width:
 
-| | warm | cold (default `lt=100`) |
+| | warm | cold (driver says so; default `lt=100`) |
 |---|---|---|
 | cutoff | 3250 | **3150** |
 | empty | 3000 | **2900** |
@@ -102,17 +102,36 @@ higher impedance and worse cold behaviour than graphite, so they sag harder
 exactly when you are closest to the floor. And the tail steepens near empty, so
 the extra 100 mV buys less charge than the number suggests.
 
-The tier is applied **whether or not** the driver runs its own
-`qcom,cutoff-voltage-adjust-enable` path (`umi` sets it, `lmi` does not). Where
-the driver does run it, the KPM wins the race simply by re-asserting on every
-voltage read — far more often than the driver's 10 s monitor tick — and
-re-asserts SRAM too, not just the C field. Unlike stock, the KPM applies
-**hysteresis** (leave the cold tier only above 17.0 °C); stock flips at exactly
-15.0 °C on a timer, so a battery resting at the threshold makes it oscillate.
+### Who decides it is cold — the driver, always
 
-Battery temperature comes from `fg_gen4_get_battery_temp` (deci-degrees C),
-sampled at most once every 16 voltage reads. If that symbol is missing the tier
-is disabled and the warm floors are used throughout.
+The KPM has **no temperature threshold of its own**. It mirrors the driver's
+`is_low_temp_flag` (a file-scope global, resolved by `kallsyms`), which is that
+driver's single source of truth for "cold" — its own cutoff pair and its
+`SHUTDOWN_DELAY_VOL_lOW_TEMP` both key off the same flag.
+
+This is deliberate, and it decides the `lmi` case correctly. That flag is only
+maintained where `qcom,cutoff-voltage-adjust-enable` is set (`umi` sets it,
+`lmi` does not), so on a kernel with no low-temp policy the flag stays false
+forever and **the KPM never enters the cold tier either**. That is the right
+answer: this module *shifts the driver's floors down*, it does not invent a
+policy the driver does not have.
+
+It also survives a different kernel. The driver's threshold is a compile-time
+`#define` (`LOW_DISCHARGE_TEMP_TRH`), not a device-tree property, so there is
+nothing per-device to read and another tree may well have compiled a different
+value. Mirroring the flag means we switch on **whatever** that tree decided,
+without knowing what it is.
+
+There is deliberately **no hysteresis** on our side either: any threshold or
+damping of our own would only create windows where the driver says cold and we
+say warm, or the reverse.
+
+Only the **step size** is ours (`lt=`) — that is the part tuned for brown-out
+margin above. `lt=0` disables the shift entirely while still tracking the flag.
+
+Where the driver does manage cutoff, the KPM wins the race simply by
+re-asserting on every voltage read — far more often than the driver's 10 s
+monitor tick — and re-asserts SRAM too, not just the C field.
 
 ## How it works (device-independent)
 
@@ -245,10 +264,9 @@ kpm control battery-fg-cutoff "3250,3000,3150"
 # force the CAPACITY ordinal if the by-name lookup ever fails on your tree
 kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,psp=44"
 
-# low-temperature tier: step (mV, 0-200) and threshold (deci-degrees C)
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=150"     # aggressive
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=0"       # disable
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lttemp=100" # cold below 10.0 C
+# low-temperature step (mV, 0-200); WHEN it is cold is the driver's call
+kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=150"  # aggressive
+kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=0"    # disable the shift
 
 # unload (restores stock cutoff 3400 / empty 3100; shutdown hook removed)
 kpm unload battery-fg-cutoff
@@ -392,7 +410,7 @@ SRAM 锚点——同时 KPM 也写 SRAM，使改动立即生效）。
 本 KPM 做同样的事，但**默认步长更小（−100 mV）**，并且三个地板统一下移，
 使 cutoff→shutdown 的「卡在 1%」窗口宽度保持不变：
 
-| | 常温 | 低温（默认 `lt=100`） |
+| | 常温 | 低温（由驱动判定；默认 `lt=100`） |
 |---|---|---|
 | cutoff | 3250 | **3150** |
 | empty | 3000 | **2900** |
@@ -414,13 +432,29 @@ SRAM 锚点——同时 KPM 也写 SRAM，使改动立即生效）。
 硅碳恰恰是**该多留余量**而非少留的理由：掺 SiOx 的负极内阻更高、低温表现比石墨更差，
 也就是说你最接近地板时它塌得最狠。而且尾段曲线会变陡，多下探这 100 mV 拿到的电量比数字看上去要少。
 
-无论驱动自身的 `qcom,cutoff-voltage-adjust-enable` 是否生效（umi 有、lmi 没有），这个档位**都会应用**。
-在驱动也会改的机型上，KPM 靠「每次读电压都重新写回」赢下这场竞争——频率远高于驱动 10 秒一次的
-monitor tick——而且连 SRAM 一起写回，不只是 C 字段。与原厂不同，KPM 带**滞回**
-（要高于 17.0℃ 才退出低温档）；原厂在定时器里按 15.0℃ 硬翻转，电池温度正好卡在阈值上时会来回抖。
+### 谁来判定「冷」——永远是驱动
 
-电池温度取自 `fg_gen4_get_battery_temp`（单位为 0.1℃），最多每 16 次电压读取采样一次。
-若该符号不存在，则关闭低温档、全程使用常温地板。
+KPM **没有自己的温度阈值**。它镜像驱动的 `is_low_temp_flag`（文件级全局变量，用 `kallsyms` 解析）——
+那正是驱动判定「冷」的唯一真值来源，它自己的 cutoff 对和 `SHUTDOWN_DELAY_VOL_lOW_TEMP`
+都由同一个标志驱动。
+
+这是刻意的，而且它把 lmi 这种情况判对了。该标志只在 `qcom,cutoff-voltage-adjust-enable`
+生效的机型上被维护（umi 有、lmi 没有），所以在没有低温策略的内核上，标志永远是 false，
+**KPM 也就永远不会进入低温档**。这才是正确答案：本模块是*把驱动的地板整体下移*，
+而不是替驱动发明一套它本来没有的策略。
+
+这样也能扛住换内核。驱动的阈值是编译期 `#define`（`LOW_DISCHARGE_TEMP_TRH`），不是设备树属性，
+既没有按机型可读的配置，别的树也完全可能编进了不同的值。镜像这个标志意味着我们跟着那棵树
+**自己决定的**结果切换，而不需要知道它是多少。
+
+我们这边同样刻意**不加滞回**：任何自己的阈值或阻尼，只会制造出「驱动说冷而我们说不冷」
+（或反过来）的窗口。
+
+只有**步长**是我们自己的（`lt=`）——那是上面按掉电余量调过的部分。`lt=0` 可以在仍然跟踪标志的
+前提下完全关闭下移。
+
+在驱动确实会管 cutoff 的机型上，KPM 靠「每次读电压都重新写回」赢下这场竞争——频率远高于驱动
+10 秒一次的 monitor tick——而且连 SRAM 一起写回，不只是 C 字段。
 
 ## 工作原理（与机型无关）
 
@@ -534,10 +568,9 @@ kpm control battery-fg-cutoff "3250,3000,3150"
 # 万一按名字查找在你的树上失败，可强制指定 CAPACITY 序号
 kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,psp=44"
 
-# 低温档位：步长（mV，0-200）与阈值（0.1℃）
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=150"     # 激进
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=0"       # 关闭低温档
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lttemp=100" # 低于 10.0℃ 算低温
+# 低温步长（mV，0-200）；何时算低温由驱动决定
+kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=150"  # 激进
+kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=0"    # 关闭下移
 
 # 卸载（恢复原厂 cutoff 3400 / empty 3100；移除关机 hook）
 kpm unload battery-fg-cutoff
