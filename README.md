@@ -4,8 +4,8 @@
 
 A [SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra) / [KernelPatch](https://github.com/bmax121/KernelPatch)
 **KPM** (Kernel Patch Module) that lowers the Qualcomm **QPNP FG-Gen4**
-fuel-gauge discharge **floor** — cutoff `3400→3250`, empty `3100→3000`, and the
-*effective shutdown voltage* `3300→3150` — entirely at runtime, in kernel space,
+fuel-gauge discharge **floor** — cutoff `3400→3200`, empty `3100→3000`, and the
+*effective shutdown voltage* `3300→3100` — entirely at runtime, in kernel space,
 with **no kernel source edits**.
 
 **Applicability.** Developed and verified on the **Redmi K30 Pro (codename
@@ -38,9 +38,9 @@ edits:**
 
 | Parameter | Stock | New | Role | How the KPM does it |
 |-----------|-------|-----|------|---------------------|
-| `cutoff_volt_mv` | 3400 | **3250** | FVSS 0% scale + hardware `msoc=0%` anchor | DT field write + SRAM word 20 |
+| `cutoff_volt_mv` | 3400 | **3200** | FVSS 0% scale + hardware `msoc=0%` anchor | DT field write + SRAM word 20 |
 | `empty_volt_mv` | 3100 | **3000** | vbatt-low IRQ threshold → arms rapid-SOC | DT field write + SRAM word 35 |
-| `SHUTDOWN_DELAY_VOL` (effective) | 3300 | **3150** | the **true** shutdown voltage | functional hook on `fg_psy_get_property` |
+| `SHUTDOWN_DELAY_VOL` | 3300 | **3100** | the **true** shutdown voltage, and the 30 s warning | `hotpatch()` on its MOVZ + hook on `fg_psy_get_property` |
 | `VBAT_CRITICAL_LOW_THR` | 2800 | *(left stock)* | rapid-SOC immediate-trip floor | **subsumed** by the shutdown hook |
 
 Two DT-field parameters are written directly (they are the **root of truth** —
@@ -51,13 +51,56 @@ the KPM also writes SRAM so the change is immediate).
 opcode the KPM **hooks `fg_psy_get_property`**: when the driver reports
 `CAPACITY == 0` while instantaneous vbatt is still above the target floor, the
 hook rewrites the result to `1%`. That extends the stock "hang at 1%" window
-from 3300 mV down to 3150 mV **functionally** — robust, no instruction-stream
+from 3300 mV down to 3100 mV **functionally** — robust, no instruction-stream
 assumptions.
 
 That same hook also **masks a premature rapid-SOC trip** (which forces
 `msoc→0`): the report stays 1% until vbatt genuinely drops below the floor. So
-the effective floor is 3150 mV regardless of when rapid latches, which is why
+the effective floor is 3100 mV regardless of when rapid latches, which is why
 lowering `VBAT_CRITICAL_LOW_THR` is unnecessary and that macro is left at stock.
+
+### Moving the 30-second warning instead of faking it
+
+Rewriting the reported capacity is enough to stop Android shutting down at 0%,
+but it cannot move the driver's **countdown**. That is armed separately:
+
+```c
+if (pval->intval == 0) {
+    shutdown_voltage = is_low_temp_flag ? 3100 : 3300;
+    if (vbatt_uv/1000 > shutdown_voltage && !charging) {
+        fg->shutdown_delay = true;   /* userspace shows 30 s, then powers off */
+        pval->intval = 1;            /* which is why you never see 0% */
+    }
+}
+```
+
+Note the direction: the flag arms while voltage is **above** the threshold, so
+*lowering* `SHUTDOWN_DELAY_VOL` widens the window rather than delaying it, and
+no value we control can produce a countdown below 3300.
+
+The stock behaviour is right — capacity hits 0, and if there is still voltage
+the user gets a warning before shutdown — it is only calibrated for graphite. So
+rather than asserting or suppressing `fg->shutdown_delay` from the hook (which
+would replace the driver's logic with our own), the KPM **moves the constant**.
+Both `SHUTDOWN_DELAY_VOL` and `SHUTDOWN_DELAY_VOL_lOW_TEMP` compile to a plain
+`MOVZ w?, #imm16`, so the module scans `fg_psy_get_property`, and rewrites the
+immediate with `hotpatch()` — KernelPatch's sanctioned primitive, which runs
+under `stop_machine` and flushes I-cache.
+
+It aims the threshold at **our own floor**, so warm and cold stay in step with
+`eff_shutdown_mv()`: the driver picks between the two patched constants using
+the same `is_low_temp_flag` the module already mirrors.
+
+Guard rails, because a wrong instruction takes the kernel down:
+
+* the scan bounds the function with `kallsyms_lookup_size_offset` and **refuses
+  to patch unless each constant occurs exactly once**;
+* only a plain 32-bit `MOVZ` is rewritten — shifted variants and `CMP` forms are
+  reported but never touched;
+* nothing within the first 64 bytes is patched (that is the hook trampoline);
+* the original words are kept and **restored on unload**;
+* `sdv=0` opts out entirely and leaves the instruction stream untouched;
+  `sdv=<mv>` overrides the target.
 
 ## Low-temperature tier
 
@@ -77,9 +120,9 @@ keeps its width:
 
 | | warm | cold (driver says so; default `lt=100`) |
 |---|---|---|
-| cutoff | 3250 | **3150** |
+| cutoff | 3200 | **3100** |
 | empty | 3000 | **2900** |
-| shutdown floor | 3150 | **3050** |
+| shutdown floor | 3100 | **3000** |
 
 **Why not simply copy stock's −200 mV.** In the cold the binding constraint is
 not cell damage — at these terminal voltages OCV is much higher, so true
@@ -92,15 +135,23 @@ floor:
 |---|---|
 | stock warm 3300 | 500 mV |
 | stock cold 3100 | 300 mV |
-| ours warm 3150 | 350 mV |
-| ours cold `lt=100` → 3050 | **250 mV** |
-| ours cold `lt=150` → 3000 | 200 mV (aggressive) |
-| ours cold `lt=200` → 2950 | 150 mV — half the OEM's cold margin, avoid |
+| ours warm 3100 | 300 mV |
+| ours cold `lt=100` → 3000 | **200 mV** |
+| ours cold `lt=150` → 2950 | 150 mV |
+| ours cold `lt=200` → 2900 | 100 mV — avoid |
 
-Si/C is a reason to keep *more* margin, not less: SiOx-blended anodes have
-higher impedance and worse cold behaviour than graphite, so they sag harder
-exactly when you are closest to the floor. And the tail steepens near empty, so
-the extra 100 mV buys less charge than the number suggests.
+The **cell** is not the limit here. Silicon-containing anodes tolerate cut-off
+voltages down to ~2.5 V precisely because their discharge curve declines
+smoothly, where graphite drops sharply below 3 V and needs ~2.8 V. The limits
+are the **system** and **cycle life**:
+
+* **System.** Silicon has lower conductivity and higher impedance than graphite,
+  so load spikes sag *harder* — exactly when you are closest to the floor. That
+  is why the cold step stays at 100 mV instead of matching stock's 200 mV.
+* **Cycle life.** Silicon anodes are commonly held above **~3.0 V** to limit the
+  volume expansion/contraction stress that drives their fade. The default cold
+  floor lands exactly on that line (3100 − 100 = **3000 mV**), which is the main
+  reason not to push `lt=` past 100 on a Si/C pack.
 
 ### Who decides it is cold — the driver, always
 
@@ -251,22 +302,26 @@ Using the KernelPatch userspace tool `kpm` (SukiSU ships an equivalent; adjust
 to your manager). A superkey is required by KernelPatch.
 
 ```bash
-# load with the defaults (cutoff 3250, empty 3000, shutdown 3150 mV)
+# load with the defaults (cutoff 3200, empty 3000, shutdown 3100 mV)
 kpm load  /data/local/tmp/fg_cutoff.kpm
 
 # load with explicit targets "cutoff[,empty[,shutdown]]" (mV) as module args
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150"
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100"
 
 # change targets at runtime (cutoff only, or more)
 kpm control battery-fg-cutoff "3200"
-kpm control battery-fg-cutoff "3250,3000,3150"
+kpm control battery-fg-cutoff "3200,3000,3100"
 
 # force the CAPACITY ordinal if the by-name lookup ever fails on your tree
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,psp=44"
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,psp=44"
 
 # low-temperature step (mV, 0-200); WHEN it is cold is the driver's call
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=150"  # aggressive
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=0"    # disable the shift
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,lt=150"  # aggressive
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,lt=0"    # disable the shift
+
+# the 30 s countdown threshold (patches SHUTDOWN_DELAY_VOL in place)
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,sdv=3050" # explicit
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,sdv=0"    # never patch code
 
 # unload (restores stock cutoff 3400 / empty 3100; shutdown hook removed)
 kpm unload battery-fg-cutoff
@@ -289,12 +344,12 @@ dmesg | grep fg-cutoff-kpm
 Expected, within a second or two of the first FG voltage poll:
 
 ```
-[fg-cutoff-kpm] init (event=..., args=) cutoff=3250 empty=3000 shutdown=3150 mV
+[fg-cutoff-kpm] init (event=..., args=) cutoff=3200 empty=3000 shutdown=3100 mV
 [fg-cutoff-kpm] syms: pkr=... sram_write=... get_voltage=... get_property=...
 [fg-cutoff-kpm] hooks installed; applying on next FG voltage read
-[fg-cutoff-kpm] SRAM CUTOFF_VOLT <- 3250 mV (raw ff 33) rc=0
+[fg-cutoff-kpm] SRAM CUTOFF_VOLT <- 3200 mV (raw 33 33) rc=0
 [fg-cutoff-kpm] SRAM VBATT_LOW  <- 3000 mV (raw 40) rc=0
-[fg-cutoff-kpm] applied: cutoff 3400->3250, empty 3100->3000, shutdown floor 3150 mV (dt @ ...)
+[fg-cutoff-kpm] applied: cutoff 3400->3200, empty 3100->3000, shutdown floor 3100 mV (dt @ ...)
 ```
 
 If `get_property=0000...` (symbol not found), cutoff/empty still apply but the
@@ -305,7 +360,7 @@ build:
 
 ```bash
 # /sys/kernel/debug/fg/sram
-#   word 20 = CUTOFF_VOLT (2 bytes LE)   3250 mV -> ff 33
+#   word 20 = CUTOFF_VOLT (2 bytes LE)   3200 mV -> 33 33
 #   word 35 byte 1 = VBATT_LOW (1 byte)  3000 mV -> 40
 ```
 
@@ -354,7 +409,7 @@ GPL-2.0-or-later (matches the Linux kernel and KernelPatch).
 
 一个 [SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra) / [KernelPatch](https://github.com/bmax121/KernelPatch)
 的 **KPM**（Kernel Patch Module），用于降低高通 **QPNP FG-Gen4** 电量计的放电**地板**
-——cutoff `3400→3250`、empty `3100→3000`、以及*有效关机电压* `3300→3150`——
+——cutoff `3400→3200`、empty `3100→3000`、以及*有效关机电压* `3300→3100`——
 全部在运行时于内核态完成，**不改任何内核源码**。
 
 **适用范围。** 在 **红米 K30 Pro（代号 `lmi`）** 上开发并验证，同时应该适用于**其它使用
@@ -380,9 +435,9 @@ GPL-2.0-or-later (matches the Linux kernel and KernelPatch).
 
 | 参数 | 原厂 | 新值 | 作用 | KPM 如何实现 |
 |-----------|-------|-----|------|---------------------|
-| `cutoff_volt_mv` | 3400 | **3250** | FVSS 0% 标度 + 硬件 `msoc=0%` 锚点 | 写 DT 字段 + SRAM word 20 |
+| `cutoff_volt_mv` | 3400 | **3200** | FVSS 0% 标度 + 硬件 `msoc=0%` 锚点 | 写 DT 字段 + SRAM word 20 |
 | `empty_volt_mv` | 3100 | **3000** | vbatt-low 中断阈值 → 触发 rapid-SOC | 写 DT 字段 + SRAM word 35 |
-| `SHUTDOWN_DELAY_VOL`（有效） | 3300 | **3150** | **真正的**关机电压 | 对 `fg_psy_get_property` 做功能性 hook |
+| `SHUTDOWN_DELAY_VOL` | 3300 | **3100** | **真正的**关机电压，以及那 30 秒警告 | `hotpatch()` 改其 MOVZ + hook `fg_psy_get_property` |
 | `VBAT_CRITICAL_LOW_THR` | 2800 | *（保持原厂）* | rapid-SOC 立即触发地板 | 被关机 hook **一并覆盖** |
 
 两个 DT 字段参数直接写入（它们是**真值之源**——每次 FG profile 重载时驱动都会从它们重新推导
@@ -390,11 +445,45 @@ SRAM 锚点——同时 KPM 也写 SRAM，使改动立即生效）。
 
 `SHUTDOWN_DELAY_VOL` 是一个编译期 `#define`，因此 KPM 不去打补丁改指令，而是 **hook
 `fg_psy_get_property`**：当驱动报 `CAPACITY == 0` 而瞬时 vbatt 仍高于目标地板时，hook 把结果改写为
-`1%`。这从**功能上**把原厂“卡在 1%”的窗口从 3300 mV 延伸到 3150 mV——稳健，不对指令流做任何假设。
+`1%`。这从**功能上**把原厂“卡在 1%”的窗口从 3300 mV 延伸到 3100 mV——稳健，不对指令流做任何假设。
 
 同一个 hook 还**掩盖了 rapid-SOC 的提前触发**（它会强制 `msoc→0`）：报告会一直保持 1%，直到 vbatt
-真正跌破地板。所以无论 rapid 何时锁存，有效地板都是 3150 mV，这也是为什么无需降低
+真正跌破地板。所以无论 rapid 何时锁存，有效地板都是 3100 mV，这也是为什么无需降低
 `VBAT_CRITICAL_LOW_THR`，该宏保持原厂值。
+
+### 挪走那 30 秒警告，而不是伪造它
+
+改写上报的电量足以阻止 Android 在 0% 关机，但**动不了驱动的倒计时**。它是另一套触发：
+
+```c
+if (pval->intval == 0) {
+    shutdown_voltage = is_low_temp_flag ? 3100 : 3300;
+    if (vbatt_uv/1000 > shutdown_voltage && 未充电) {
+        fg->shutdown_delay = true;   // 用户态弹 30 秒，然后关机
+        pval->intval = 1;            // 所以你永远看不到 0%
+    }
+}
+```
+
+注意方向：旗子是在电压**高于**阈值时举起的，所以*调低* `SHUTDOWN_DELAY_VOL` 只会让窗口变宽而非推迟；
+而且在 3300 以下，我们能控制的任何数值都无法产生倒计时。
+
+原厂行为本身是对的——电量归零、若还有电压就先警告再关机——只是它按石墨标定。因此模块不去
+在 hook 里伪造或压制 `fg->shutdown_delay`（那等于用我们的逻辑替换驱动的），而是**把常量挪走**。
+`SHUTDOWN_DELAY_VOL` 和 `SHUTDOWN_DELAY_VOL_lOW_TEMP` 都编译成朴素的 `MOVZ w?, #imm16`，
+所以模块扫描 `fg_psy_get_property`，再用 `hotpatch()` 改写立即数——那是 KernelPatch 正式导出的
+原语，内部走 `stop_machine` 并刷新 I-cache。
+
+阈值瞄准的是**我们自己的地板**，因此常温/低温与 `eff_shutdown_mv()` 保持同步：驱动在两个被改过的
+常量之间做选择时，用的正是模块已经在镜像的那个 `is_low_temp_flag`。
+
+因为改错一条指令会让内核跑飞，所以设了这些护栏：
+
+* 扫描用 `kallsyms_lookup_size_offset` 精确定界函数，**除非每个常量恰好出现一次，否则拒绝打补丁**；
+* 只改写朴素的 32 位 `MOVZ`——带移位的变体和 `CMP` 形态只报告、绝不触碰；
+* 函数前 64 字节内一律不动（那是 hook 的 trampoline）；
+* 保存原始指令字，**卸载时恢复**；
+* `sdv=0` 完全退出，指令流一个字节都不碰；`sdv=<mv>` 可指定目标值。
 
 ## 低温档位
 
@@ -412,9 +501,9 @@ SRAM 锚点——同时 KPM 也写 SRAM，使改动立即生效）。
 
 | | 常温 | 低温（由驱动判定；默认 `lt=100`） |
 |---|---|---|
-| cutoff | 3250 | **3150** |
+| cutoff | 3200 | **3100** |
 | empty | 3000 | **2900** |
-| 关机地板 | 3150 | **3050** |
+| 关机地板 | 3100 | **3000** |
 
 **为什么不直接照抄原厂的 −200 mV。** 低温下真正的约束不是电芯损伤——这种端电压下 OCV 高得多，
 真实放电深度其实不大——而是**系统掉电重启**：正是那个「值得往下探」的内阻，同时让负载尖峰塌得更狠。
@@ -424,13 +513,18 @@ SRAM 锚点——同时 KPM 也写 SRAM，使改动立即生效）。
 |---|---|
 | 原厂常温 3300 | 500 mV |
 | 原厂低温 3100 | 300 mV |
-| 本模块常温 3150 | 350 mV |
-| 本模块低温 `lt=100` → 3050 | **250 mV** |
-| 本模块低温 `lt=150` → 3000 | 200 mV（激进） |
-| 本模块低温 `lt=200` → 2950 | 150 mV——只有原厂低温余量的一半，不建议 |
+| 本模块常温 3100 | 300 mV |
+| 本模块低温 `lt=100` → 3000 | **200 mV** |
+| 本模块低温 `lt=150` → 2950 | 150 mV |
+| 本模块低温 `lt=200` → 2900 | 100 mV——不建议 |
 
-硅碳恰恰是**该多留余量**而非少留的理由：掺 SiOx 的负极内阻更高、低温表现比石墨更差，
-也就是说你最接近地板时它塌得最狠。而且尾段曲线会变陡，多下探这 100 mV 拿到的电量比数字看上去要少。
+**限制来自系统和寿命，不是电芯。** 含硅负极的放电曲线下降平滑，正因如此其截止电压可以低到
+约 **2.5 V**；而石墨在 3 V 以下电压陡降，通常需要 2.8 V 左右。真正卡住的是：
+
+* **系统**：硅的导电性比石墨差、内阻更高，负载尖峰塌得**更狠**——而这恰好发生在你最接近地板的时候。
+  这就是低温步长保持 100 mV 而不照抄原厂 200 mV 的原因。
+* **寿命**：硅负极通常建议保持在 **~3.0 V** 以上，以限制导致其衰减的膨胀/收缩应力。默认低温地板
+  正好落在这条线上（3100 − 100 = **3000 mV**），这也是硅碳电池不建议把 `lt=` 调过 100 的主要理由。
 
 ### 谁来判定「冷」——永远是驱动
 
@@ -555,22 +649,26 @@ KPM 运行在内核上下文中，而 arm64 Linux 在进入内核时不会保存
 superkey。
 
 ```bash
-# 用默认值加载（cutoff 3250、empty 3000、shutdown 3150 mV）
+# 用默认值加载（cutoff 3200、empty 3000、shutdown 3100 mV）
 kpm load  /data/local/tmp/fg_cutoff.kpm
 
 # 以模块参数 "cutoff[,empty[,shutdown]]"（mV）显式指定目标加载
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150"
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100"
 
 # 运行时修改目标（仅 cutoff，或更多）
 kpm control battery-fg-cutoff "3200"
-kpm control battery-fg-cutoff "3250,3000,3150"
+kpm control battery-fg-cutoff "3200,3000,3100"
 
 # 万一按名字查找在你的树上失败，可强制指定 CAPACITY 序号
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,psp=44"
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,psp=44"
 
 # 低温步长（mV，0-200）；何时算低温由驱动决定
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=150"  # 激进
-kpm load  /data/local/tmp/fg_cutoff.kpm "3250,3000,3150,lt=0"    # 关闭下移
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,lt=150"  # 激进
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,lt=0"    # 关闭下移
+
+# 30 秒倒计时的触发阈值（就地改写 SHUTDOWN_DELAY_VOL）
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,sdv=3050" # 指定
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,sdv=0"    # 绝不改指令
 
 # 卸载（恢复原厂 cutoff 3400 / empty 3100；移除关机 hook）
 kpm unload battery-fg-cutoff
@@ -591,12 +689,12 @@ dmesg | grep fg-cutoff-kpm
 在首次 FG 电压轮询后一两秒内，预期看到：
 
 ```
-[fg-cutoff-kpm] init (event=..., args=) cutoff=3250 empty=3000 shutdown=3150 mV
+[fg-cutoff-kpm] init (event=..., args=) cutoff=3200 empty=3000 shutdown=3100 mV
 [fg-cutoff-kpm] syms: pkr=... sram_write=... get_voltage=... get_property=...
 [fg-cutoff-kpm] hooks installed; applying on next FG voltage read
-[fg-cutoff-kpm] SRAM CUTOFF_VOLT <- 3250 mV (raw ff 33) rc=0
+[fg-cutoff-kpm] SRAM CUTOFF_VOLT <- 3200 mV (raw 33 33) rc=0
 [fg-cutoff-kpm] SRAM VBATT_LOW  <- 3000 mV (raw 40) rc=0
-[fg-cutoff-kpm] applied: cutoff 3400->3250, empty 3100->3000, shutdown floor 3150 mV (dt @ ...)
+[fg-cutoff-kpm] applied: cutoff 3400->3200, empty 3100->3000, shutdown floor 3100 mV (dt @ ...)
 ```
 
 若 `get_property=0000...`（符号未找到），cutoff/empty 仍会应用，但关机地板保持原厂 3300 mV。
@@ -605,7 +703,7 @@ dmesg | grep fg-cutoff-kpm
 
 ```bash
 # /sys/kernel/debug/fg/sram
-#   word 20 = CUTOFF_VOLT（2 字节 LE）    3250 mV -> ff 33
+#   word 20 = CUTOFF_VOLT（2 字节 LE）    3200 mV -> 33 33
 #   word 35 byte 1 = VBATT_LOW（1 字节）  3000 mV -> 40
 ```
 

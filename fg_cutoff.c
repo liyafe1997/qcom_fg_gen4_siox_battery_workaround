@@ -7,9 +7,9 @@
  * has a usable sub-3.4V tail. EVERYTHING is done from this module — no kernel
  * source edits. Conservative tier defaults:
  *
- *     cutoff_volt_mv        : 3400 -> 3250   (dt field + SRAM CUTOFF_VOLT)
+ *     cutoff_volt_mv        : 3400 -> 3200   (dt field + SRAM CUTOFF_VOLT)
  *     empty_volt_mv         : 3100 -> 3000   (dt field + SRAM VBATT_LOW)
- *     SHUTDOWN_DELAY_VOL eff : 3300 -> 3150   (functional hook, see below)
+ *     SHUTDOWN_DELAY_VOL eff : 3300 -> 3100   (functional hook, see below)
  *
  * Why a hook for SHUTDOWN_DELAY_VOL instead of patching the #define:
  *   The effective shutdown voltage is SHUTDOWN_DELAY_VOL, not cutoff — when the
@@ -42,7 +42,13 @@
  *     is_low_temp_flag -- no threshold of our own, so a kernel with no low-temp
  *     policy (lmi) never enters the tier either. Where the driver does manage
  *     cutoff we win the race by re-asserting on every voltage read.
- *   - Stock values are restored on unload.
+ *   - SHUTDOWN_DELAY_VOL (3300) and its low-temp twin (3100) are compile-time
+ *     constants, so the 30 s warning + shutdown is calibrated for graphite. We
+ *     keep that behaviour and just move it: both are plain MOVZ imm16, located
+ *     by a uniqueness-checked scan and rewritten with hotpatch() (stop_machine
+ *     + I-cache flush) to aim at our own floor. Refused unless each constant
+ *     occurs exactly once. "sdv=0" opts out.
+ *   - Stock values are restored on unload, including the patched instructions.
  */
 
 #include <compiler.h>
@@ -107,7 +113,7 @@ static int fmt_msg(char *buf, int size, const char *fmt, ...)
 }
 
 KPM_NAME("battery-fg-cutoff");
-KPM_VERSION("1.5.0");
+KPM_VERSION("1.6.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("battery-fg-fix-kpm");
 KPM_DESCRIPTION("Lower FG-Gen4 cutoff + empty + shutdown floor (lmi / Si-C tier)");
@@ -116,7 +122,7 @@ KPM_DESCRIPTION("Lower FG-Gen4 cutoff + empty + shutdown floor (lmi / Si-C tier)
 /* Tunables (conservative tier)                                        */
 /* ------------------------------------------------------------------ */
 
-#define DEFAULT_CUTOFF_MV   3250
+#define DEFAULT_CUTOFF_MV   3200
 #define CUTOFF_MV_MIN       2800
 #define CUTOFF_MV_MAX       3400
 
@@ -124,7 +130,7 @@ KPM_DESCRIPTION("Lower FG-Gen4 cutoff + empty + shutdown floor (lmi / Si-C tier)
 #define EMPTY_MV_MIN        2500
 #define EMPTY_MV_MAX        3300
 
-#define DEFAULT_SHUTDOWN_MV 3150   /* effective shutdown floor (hang-at-1% end) */
+#define DEFAULT_SHUTDOWN_MV 3100   /* effective shutdown floor (hang-at-1% end) */
 #define SHUTDOWN_MV_MIN     2800
 #define SHUTDOWN_MV_MAX     3300
 
@@ -150,10 +156,14 @@ KPM_DESCRIPTION("Lower FG-Gen4 cutoff + empty + shutdown floor (lmi / Si-C tier)
  * depth-of-discharge stays modest -- it is system brown-out, because the same
  * impedance that justifies going lower also makes load spikes sag harder.
  * Headroom over sys_min_volt_mv (2800 on lmi) at the shutdown floor:
- *     stock warm 500 mV | stock cold 300 mV | ours warm 350 mV
- *     ours cold at -100 => 250 mV   (default)
- *     ours cold at -150 => 200 mV   (aggressive)
- *     ours cold at -200 => 150 mV   (below what the OEM considered safe; avoid)
+ *     stock warm 500 mV | stock cold 300 mV | ours warm 300 mV
+ *     ours cold at -100 => 200 mV   (default)
+ *     ours cold at -150 => 150 mV
+ *     ours cold at -200 => 100 mV   (avoid)
+ * Si/C tolerates the cell voltage (silicon anodes run to 2.5-3.0 V), so the
+ * limit here is the SYSTEM, not the cell -- and silicon's higher impedance
+ * makes load spikes sag harder than graphite, which is why the cold step is
+ * left at 100 rather than matching stock's 200.
  *
  * Applied uniformly to all three floors so the cutoff->shutdown "hang at 1%"
  * window keeps its width. Tunable at load time with "lt=<mv>".
@@ -222,6 +232,8 @@ typedef int  (*fg_sram_write_t)(void *fg, unsigned short address, unsigned char 
 typedef int  (*fg_sram_read_t)(void *fg, unsigned short address, unsigned char offset,
                                unsigned char *val, int len, int flags);
 typedef int  (*fg_get_batt_volt_t)(void *fg, int *val_uv);
+typedef int  (*ksym_size_off_t)(unsigned long addr, unsigned long *size, unsigned long *off);
+typedef int  (*insn_patch_text_t)(void *addrs[], unsigned int insns[], int cnt);
 
 static probe_kernel_read_t p_probe_kernel_read;
 static fg_sram_write_t     p_fg_sram_write;
@@ -246,6 +258,13 @@ static int  *empty_field;              /* kernel VA of dt.empty_volt_mv (= +1)  
 static void *chip_ptr;                 /* cached chip == fg base; "located" gate */
 static int   psp_capacity  = -1;       /* resolved at init (name lookup / arg)   */
 static int   psp_from_arg  = -1;       /* "psp=<n>" override, -1 = unset         */
+
+/* SHUTDOWN_DELAY_VOL instruction patch: sites, originals, and the arg. */
+static void        *sdv_addr[2];        /* [0] = normal site, [1] = low-temp   */
+static unsigned int sdv_orig[2];        /* original words, for restore         */
+static int          sdv_patched;
+static int          sdv_from_arg = -1;  /* -1 unset, 0 disable, >0 explicit mV */
+static insn_patch_text_t p_insn_patch_text;
 
 static int   reassert_logs_left = 3;    /* driver-overwrote-us notices          */
 static int   diag_dumps_left = 3;       /* one-shot memory dumps on scan failure */
@@ -395,6 +414,247 @@ static int resolve_psp_capacity(void)
         }
     }
     return -1;
+}
+
+/*
+ * READ-ONLY probe: how is SHUTDOWN_DELAY_VOL materialised in this build?
+ *
+ * The driver decides the shutdown/countdown threshold from two compile-time
+ * constants that live in the instruction stream, not in memory:
+ *     SHUTDOWN_DELAY_VOL          3300
+ *     SHUTDOWN_DELAY_VOL_lOW_TEMP 3100
+ * Both are < 4096, so the compiler can encode either as a MOVZ imm16 or fold
+ * it straight into a CMP imm12. This walks fg_psy_get_property() and reports
+ * every voltage-looking immediate it finds, so we can see whether the constant
+ * appears EXACTLY ONCE (patchable with hotpatch()) or is ambiguous (leave it
+ * alone). Nothing is written -- this only reads and prints.
+ */
+#define INSN_IS_MOVZ32(i)  (((i) & 0xFFE00000u) == 0x52800000u)  /* movz w?, #imm16 */
+#define INSN_IS_MOVZ64(i)  (((i) & 0xFFE00000u) == 0xD2800000u)  /* movz x?, #imm16 */
+#define INSN_MOVZ_IMM(i)   (((i) >> 5) & 0xFFFFu)
+#define INSN_MOVZ_HW(i)    (((i) >> 21) & 3u)
+#define INSN_IS_CMP32(i)   (((i) & 0xFF000000u) == 0x71000000u)  /* subs wzr, w?, #imm12 */
+#define INSN_CMP_IMM(i)    (((i) >> 10) & 0xFFFu)
+#define INSN_CMP_SH(i)     (((i) >> 22) & 1u)
+
+#define SDV_SCAN_FALLBACK  0x2000   /* if the symbol size is unavailable */
+#define SDV_MV_LO          2500     /* only report plausible cell voltages */
+#define SDV_MV_HI          3700
+#define SDV_MAX_PRINT      16
+#define SDV_ENTRY_GUARD    64       /* never touch the hook trampoline area */
+
+/* Replace the imm16 field of a MOVZ, leaving sf/hw/Rd untouched. */
+static unsigned int movz_set_imm(unsigned int insn, unsigned int imm)
+{
+    return (insn & ~(0xFFFFu << 5)) | ((imm & 0xFFFFu) << 5);
+}
+
+/*
+ * Locate the two constants. Returns 1 only when BOTH the 3300 and the 3100
+ * site are unique -- anything else and we refuse to touch the instruction
+ * stream, because patching the wrong word takes the kernel down.
+ */
+static int find_sdv_sites(int report)
+{
+    unsigned long base = (unsigned long)p_fg_psy_get_property;
+    unsigned long size = 0, off = 0, i, n;
+    ksym_size_off_t size_off;
+    int shown = 0, n3300 = 0, n3100 = 0, sized = 1;
+
+    sdv_addr[0] = sdv_addr[1] = 0;
+
+    if (!base || !p_probe_kernel_read)
+        return 0;
+
+    size_off = (ksym_size_off_t)kallsyms_lookup_name("kallsyms_lookup_size_offset");
+    if (!size_off || !size_off(base, &size, &off) || !size) {
+        size = SDV_SCAN_FALLBACK;
+        sized = 0;
+    }
+
+    if (report)
+        pr_info(LOG_PREFIX "SDV scan: fg_psy_get_property=%px size=%d%s\n",
+                (void *)base, (int)size, sized ? "" : " (fallback, size unknown)");
+
+    n = size / 4;
+    for (i = 0; i < n; i++) {
+        unsigned long at = base + i * 4;
+        unsigned int insn = 0, imm = 0;
+        const char *kind, *tag = "";
+
+        if (safe_read_ints((const void *)at, (int *)&insn, 1) != 0)
+            break;
+
+        if (INSN_IS_MOVZ32(insn) && INSN_MOVZ_HW(insn) == 0) {
+            imm = INSN_MOVZ_IMM(insn);
+            kind = "MOVZ";
+        } else if (INSN_IS_MOVZ64(insn) && INSN_MOVZ_HW(insn) == 0) {
+            imm = INSN_MOVZ_IMM(insn);
+            kind = "MOVZx";
+        } else if (INSN_IS_CMP32(insn) && INSN_CMP_SH(insn) == 0) {
+            imm = INSN_CMP_IMM(insn);
+            kind = "CMP ";
+        } else {
+            continue;
+        }
+
+        if (imm < SDV_MV_LO || imm > SDV_MV_HI)
+            continue;
+
+        /* Only a plain 32-bit MOVZ is safely rewritable in place; a CMP would
+         * need the same treatment but we have never seen one here, so treat it
+         * as "found but not patchable" and let the uniqueness test fail. */
+        if (imm == 3300) {
+            n3300++;
+            tag = "  <== SHUTDOWN_DELAY_VOL";
+            if (INSN_IS_MOVZ32(insn) && i * 4 >= SDV_ENTRY_GUARD) {
+                sdv_addr[0] = (void *)at;
+                sdv_orig[0] = insn;
+            }
+        }
+        if (imm == 3100) {
+            n3100++;
+            tag = "  <== SHUTDOWN_DELAY_VOL_lOW_TEMP";
+            if (INSN_IS_MOVZ32(insn) && i * 4 >= SDV_ENTRY_GUARD) {
+                sdv_addr[1] = (void *)at;
+                sdv_orig[1] = insn;
+            }
+        }
+
+        if (report && shown++ < SDV_MAX_PRINT)
+            pr_info(LOG_PREFIX "SDV   +0x%04x  insn=%08x  %s imm=%d%s\n",
+                    (int)(i * 4), insn, kind, (int)imm, tag);
+    }
+
+    if (report)
+        pr_info(LOG_PREFIX "SDV scan done: %d in range, 3300 x%d, 3100 x%d\n",
+                shown, n3300, n3100);
+
+    if (n3300 != 1 || !sdv_addr[0]) {
+        sdv_addr[0] = sdv_addr[1] = 0;
+        return 0;
+    }
+    if (n3100 != 1)
+        sdv_addr[1] = 0;       /* patch the normal one only */
+    return 1;
+}
+
+/*
+ * Lower the driver's own countdown threshold instead of faking its output.
+ *
+ * The stock logic is exactly what we want -- capacity hits 0, and if there is
+ * still voltage the user gets a 30 s warning before shutdown -- it is only
+ * calibrated for graphite. Rewriting the two constants keeps that behaviour
+ * bit-for-bit and just moves it down for a Si/C cell, which is far cleaner
+ * than asserting or suppressing fg->shutdown_delay from our hook.
+ *
+ * We aim the threshold at our own floor, so warm/cold stay in step with
+ * eff_shutdown_mv(): the driver picks between the two patched constants using
+ * the same is_low_temp_flag we already mirror.
+ *
+ * Patching goes through the KERNEL's own aarch64_insn_patch_text(), resolved by
+ * kallsyms -- not KernelPatch's hotpatch(). Both do the same job (stop_machine,
+ * fixmap-writable alias, cache maintenance), but hotpatch() was only added to
+ * the KP_EXPORT_SYMBOL table in kpimg 0.13.0, and referencing a symbol an older
+ * kpimg does not export makes the module fail to LOAD AT ALL -- the same class
+ * of failure as snprintf. The kernel symbol has no such version coupling.
+ * Originals are kept and put back on unload.
+ */
+static void patch_shutdown_delay_vol(void)
+{
+    void *addrs[2];
+    unsigned int vals[2];
+    int warm, cold, cnt = 0, rc, i;
+
+    if (sdv_from_arg == 0) {
+        pr_info(LOG_PREFIX "SDV patch disabled (sdv=0)\n");
+        return;
+    }
+
+    warm = sdv_from_arg > 0 ? sdv_from_arg : target_shutdown_mv;
+    warm = clamp_i(warm, SHUTDOWN_MV_MIN, SHUTDOWN_MV_MAX);
+    cold = clamp_i(warm - lt_delta_mv, SHUTDOWN_MV_MIN, SHUTDOWN_MV_MAX);
+
+    if (!p_insn_patch_text) {
+        pr_info(LOG_PREFIX "SDV: aarch64_insn_patch_text not found; leaving 3300 alone\n");
+        return;
+    }
+
+    if (!find_sdv_sites(1)) {
+        pr_info(LOG_PREFIX "SDV NOT unique or not a plain MOVZ -- refusing to patch\n");
+        return;
+    }
+
+    addrs[cnt] = sdv_addr[0];
+    vals[cnt++] = movz_set_imm(sdv_orig[0], (unsigned int)warm);
+    if (sdv_addr[1]) {
+        addrs[cnt] = sdv_addr[1];
+        vals[cnt++] = movz_set_imm(sdv_orig[1], (unsigned int)cold);
+    }
+
+    rc = p_insn_patch_text(addrs, vals, cnt);
+    if (rc) {
+        pr_err(LOG_PREFIX "SDV patch failed rc=%d; stock 3300 retained\n", rc);
+        return;
+    }
+    sdv_patched = cnt;
+
+    /*
+     * rc == 0 only says the API accepted the write. Read the words back and
+     * confirm the immediate really changed -- an instruction patch that
+     * silently did not land would be indistinguishable from success, and this
+     * module has been bitten by exactly that failure mode twice already.
+     */
+    for (i = 0; i < cnt; i++) {
+        unsigned int now = 0;
+
+        if (safe_read_ints(addrs[i], (int *)&now, 1) != 0) {
+            pr_err(LOG_PREFIX "SDV verify: cannot read back %px\n", addrs[i]);
+            continue;
+        }
+        if (now != vals[i]) {
+            pr_err(LOG_PREFIX "SDV verify FAILED @%px: want %08x got %08x\n",
+                   addrs[i], vals[i], now);
+            continue;
+        }
+        pr_info(LOG_PREFIX "SDV verified @%px: %08x -> %08x (imm %d -> %d)\n",
+                addrs[i], sdv_orig[i], now,
+                (int)INSN_MOVZ_IMM(sdv_orig[i]), (int)INSN_MOVZ_IMM(now));
+    }
+
+    pr_info(LOG_PREFIX "SDV active: countdown threshold %d mV warm%s\n",
+            warm, sdv_addr[1] ? ", cold follows lt=" : " (low-temp site left stock)");
+}
+
+static void restore_shutdown_delay_vol(void)
+{
+    void *addrs[2];
+    unsigned int vals[2];
+    int i, cnt = 0;
+
+    for (i = 0; i < sdv_patched; i++) {
+        if (!sdv_addr[i])
+            continue;
+        addrs[cnt] = sdv_addr[i];
+        vals[cnt++] = sdv_orig[i];
+    }
+    if (!cnt)
+        return;
+    if (!p_insn_patch_text || p_insn_patch_text(addrs, vals, cnt)) {
+        pr_err(LOG_PREFIX "SDV restore FAILED -- constants left patched\n");
+    } else {
+        int ok = 1;
+
+        for (i = 0; i < cnt; i++) {
+            unsigned int now = 0;
+
+            if (safe_read_ints(addrs[i], (int *)&now, 1) != 0 || now != vals[i])
+                ok = 0;
+        }
+        pr_info(LOG_PREFIX "SDV restored to stock (%s)\n",
+                ok ? "verified" : "READ-BACK MISMATCH");
+    }
+    sdv_patched = 0;
 }
 
 /*
@@ -718,6 +978,9 @@ static void after_get_property(hook_fargs3_t *args, void *udata)
  *   "3250,3000,3150"      "3250,3000,3150,psp=44"      "psp=44"
  *
  * Low-temperature tier:
+ *   "sdv=<mv>" rewrite the driver's own SHUTDOWN_DELAY_VOL to this (default:
+ *              follow target_shutdown_mv). "sdv=0" leaves the instruction
+ *              stream untouched.
  *   "lt=<mv>"  how far all three floors drop while the driver reports cold
  *              (0..200, default 100). "lt=0" disables the tier entirely.
  *              WHEN it is cold is the driver's call, not ours -- see
@@ -741,6 +1004,17 @@ static void set_targets_from_args(const char *args)
     int idx = 0, v = 0, in = 0;
 
     for (; s && *s; s++) {
+        if (kw_is(s, "sdv=")) {
+            int v = 0, got = 0;
+
+            s += 4;
+            for (; *s >= '0' && *s <= '9'; s++) { v = v * 10 + (*s - '0'); got = 1; }
+            if (got)
+                sdv_from_arg = v;          /* 0 disables the instruction patch */
+            if (!*s)
+                break;
+            continue;
+        }
         if (kw_is(s, "lt=")) {
             int v = 0, got = 0;
 
@@ -803,6 +1077,7 @@ static long fg_cutoff_init(const char *args, const char *event, void *__user res
     p_fg_get_battery_voltage = (void *)kallsyms_lookup_name("fg_get_battery_voltage");
     p_fg_psy_get_property    = (void *)kallsyms_lookup_name("fg_psy_get_property");
     p_is_low_temp_flag       = (const void *)kallsyms_lookup_name("is_low_temp_flag");
+    p_insn_patch_text        = (insn_patch_text_t)kallsyms_lookup_name("aarch64_insn_patch_text");
 
     pr_info(LOG_PREFIX "syms: pkr=%px sram_write=%px sram_read=%px get_voltage=%px get_property=%px\n",
             p_probe_kernel_read, p_fg_sram_write, p_fg_sram_read,
@@ -839,6 +1114,10 @@ static long fg_cutoff_init(const char *args, const char *event, void *__user res
         pr_err(LOG_PREFIX "hook_wrap2(get_voltage) failed err=%d\n", err);
         return -1;
     }
+
+    /* Move the driver's own countdown threshold down to our floor, before the
+     * hook rewrites the function entry. */
+    patch_shutdown_delay_vol();
 
     /* Shutdown-floor extension: optional but recommended. If the symbol is
      * missing we still deliver cutoff/empty. */
@@ -904,6 +1183,8 @@ static long fg_cutoff_exit(void *__user reserved)
         pr_info(LOG_PREFIX "restored cutoff=%d empty=%d mV\n",
                 orig_cutoff_mv, orig_empty_mv);
     }
+
+    restore_shutdown_delay_vol();
 
     if (p_fg_psy_get_property)
         unhook(p_fg_psy_get_property);

@@ -84,6 +84,43 @@ if [ -f fg_cutoff.kpm ]; then
         echo ">> undefined symbols all resolvable by kpimg"
 
         # -------------------------------------------------------------------
+        # kpimg export-surface baseline.
+        #
+        # Checking against $KP_DIR is NOT sufficient: it validates against the
+        # headers we happen to build with, while the phone runs whatever kpimg
+        # its boot image was patched with -- often older. kpimg's export table
+        # has GROWN over releases (hotpatch, for one, only became a
+        # KP_EXPORT_SYMBOL in 0.13.0), and referencing a symbol the installed
+        # kpimg lacks makes the module fail to LOAD AT ALL, before init runs --
+        # the same silent failure as an unexported libc function.
+        #
+        # So pin the surface: these five are known to resolve as far back as
+        # kpimg 0.12.0. Anything new must be justified against the OLDEST kpimg
+        # you intend to support, then added here.
+        # -------------------------------------------------------------------
+        baseline="${KP_UND_BASELINE:-compat_copy_to_user hook_wrap kallsyms_lookup_name printk unhook}"
+        newsyms=
+        while read -r sym; do
+            [ -n "$sym" ] || continue
+            case " $baseline " in
+                *" $sym "*) ;;
+                *) newsyms="$newsyms $sym" ;;
+            esac
+        done < <("$readelf" -sW fg_cutoff.kpm | awk '$7 == "UND" && $8 != "" { print $8 }' | sort -u)
+
+        if [ -n "$newsyms" ]; then
+            echo >&2
+            echo "!! new kpimg symbol dependency beyond the verified baseline:" >&2
+            for sym in $newsyms; do echo "!!   $sym" >&2; done
+            echo "!! \$KP_DIR exports it, but an older installed kpimg may not --" >&2
+            echo "!! that makes the module fail to load with no init output at all." >&2
+            echo "!! Prefer resolving kernel functions via kallsyms_lookup_name;" >&2
+            echo "!! if the dependency is deliberate, add it to KP_UND_BASELINE." >&2
+            exit 1
+        fi
+        echo ">> kpimg symbol surface matches the verified baseline"
+
+        # -------------------------------------------------------------------
         # Alignment / relocation check.
         #
         # kpimg allocates a module with kp_malloc_exec(), which only guarantees
