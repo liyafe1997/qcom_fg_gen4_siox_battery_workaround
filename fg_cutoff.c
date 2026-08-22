@@ -193,6 +193,7 @@ KPM_DESCRIPTION("FG-Gen4: lower cutoff/empty/shutdown floor + pure-FVSS SOC (Si-
  * "psp=<n>" module argument.
  */
 #define PSP_CAPACITY_FALLBACK 44
+#define PSP_MAX               255  /* "psp=<n>" sanity bound on the ordinal */
 
 /*
  * dt-block detection — deliberately NOT keyed on any device's specific DT
@@ -1163,121 +1164,289 @@ static void after_get_msoc(hook_fargs2_t *args, void *udata)
 /* KPM lifecycle                                                      */
 /* ------------------------------------------------------------------ */
 
-/*
- * Args: up to three bare decimal ints, positionally cutoff[,empty[,shutdown]]
- * ("3250", "3250,3000", "3250,3000,3150"), plus an optional "psp=<n>" token
- * that forces the POWER_SUPPLY_PROP_CAPACITY ordinal when the by-name lookup
- * cannot work on an unusual tree. Order and separators are free-form:
- *   "3250,3000,3150"      "3250,3000,3150,psp=44"      "psp=44"
- *
- * Low-temperature tier:
- *   "sdv=<mv>" rewrite the driver's own SHUTDOWN_DELAY_VOL to this (default:
- *              follow target_shutdown_mv). "sdv=0" leaves the instruction
- *              stream untouched.
- *   "lt=<mv>"  how far all three floors drop while the driver reports cold
- *              (0..200, default 100). "lt=0" disables the tier entirely.
- *              WHEN it is cold is the driver's call, not ours -- see
- *              update_low_temp_tier().
- *
- * Pure FVSS:
- *   "fvss=0"   leave the hardware msoc's veto over the FVSS voltage SOC in
- *              place, i.e. stock behaviour. Default is 1 (veto disabled) --
- *              see after_get_msoc(). Accepted by KPM_CTL0 too, so the veto can
- *              be switched back on live without unloading.
- */
-static int kw_is(const char *s, const char *kw)
-{
-    for (; *kw; s++, kw++) {
-        char c = (*s >= 'A' && *s <= 'Z') ? (char)(*s + 32) : *s;
+#define ARG_TOK_MAX   32       /* longest token we echo back in a message */
+#define ARG_VAL_MAX   1000000  /* refuse before an int could overflow       */
 
-        if (c != *kw)
-            return 0;
-    }
-    return 1;
+/*
+ * Whitespace only PADS -- runs of it collapse. ',' and ';' DELIMIT, so each one
+ * starts a new field and two in a row make an empty one, which is what lets
+ * "3200,,3100" mean "leave empty_volt alone" instead of silently sliding 3100
+ * into it.
+ */
+static int is_ws(char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
-static void set_targets_from_args(const char *args)
+static int is_delim(char c)
 {
-    const char *s = args;
-    int vals[3];
-    int idx = 0, v = 0, in = 0;
+    return c == ',' || c == ';';
+}
 
-    for (; s && *s; s++) {
-        if (kw_is(s, "sdv=")) {
-            int v = 0, got = 0;
+/* The WHOLE of [s, end) must be plain decimal digits. 0 on success. */
+static int parse_uint(const char *s, const char *end, int *out)
+{
+    long long v = 0;
 
-            s += 4;
-            for (; *s >= '0' && *s <= '9'; s++) { v = v * 10 + (*s - '0'); got = 1; }
-            if (got)
-                sdv_from_arg = v;          /* 0 disables the instruction patch */
-            if (!*s)
-                break;
-            continue;
+    if (s >= end)
+        return -1;                     /* empty token */
+    for (; s < end; s++) {
+        if (*s < '0' || *s > '9')
+            return -1;                 /* not a plain decimal */
+        v = v * 10 + (*s - '0');
+        if (v > ARG_VAL_MAX)
+            return -1;                 /* absurd, and about to overflow */
+    }
+    *out = (int)v;
+    return 0;
+}
+
+/* Case-insensitive compare of [s, end) against a NUL-terminated key. */
+static int key_eq(const char *s, const char *end, const char *key)
+{
+    for (; s < end && *key; s++, key++) {
+        char c = (*s >= 'A' && *s <= 'Z') ? (char)(*s + 32) : *s;
+
+        if (c != *key)
+            return 0;
+    }
+    return s == end && !*key;
+}
+
+/* NUL-terminated copy of [s, end), truncated to fit, for log messages. */
+static void tok_copy(char *buf, int len, const char *s, const char *end)
+{
+    int n = 0;
+
+    while (s < end && n < len - 1)
+        buf[n++] = *s++;
+    buf[n] = '\0';
+}
+
+/*
+ * Apply one value, or refuse it and leave the parameter alone.
+ *
+ * "Leave it alone" is the whole point: at load time that is the compiled
+ * default, from KPM_CTL0 it is whatever is currently live. Either way a
+ * parameter we could not validate never changes, and never gets coerced into
+ * something the caller did not ask for.
+ */
+static int arg_set(const char *what, int v, int lo, int hi, int *dst, int *rejected)
+{
+    if (v < lo || v > hi) {
+        pr_err(LOG_PREFIX "arg: %s=%d out of range [%d,%d] -- rejected, keeping %d\n",
+               what, v, lo, hi, *dst);
+        (*rejected)++;
+        return -1;
+    }
+    *dst = v;
+    return 0;
+}
+
+/*
+ * Strict parser shared by the load-time args and KPM_CTL0.
+ *
+ * Grammar: fields separated by ',' or ';', with whitespace as padding (runs of
+ * whitespace also separate). A field is either "key=value", a bare decimal, or
+ * empty; bare decimals are positional in the order cutoff, empty, shutdown, and
+ * an EMPTY field consumes its slot without setting anything:
+ *
+ *     "3200"   "3200,3000,3100"   "cutoff=3200,shutdown=3100"
+ *     "3200,,3100"   -> cutoff and shutdown, empty_volt left alone
+ *     "3200,3000,3100,lt=150,sdv=0,fvss=0,psp=44"
+ *
+ * Keys: cutoff, empty, shutdown (mV, same clamps as the positional form),
+ *       lt (0..200), sdv (0 = never patch code, else mV), fvss (0|1),
+ *       psp (CAPACITY ordinal override).
+ *
+ * THE CONTRACT: anything we cannot parse AND range-check leaves the parameter
+ * it would have set at its current value, and says so in the log. Nothing is
+ * silently coerced. That is a deliberate reversal of the old behaviour, which
+ * clamped: "320" -- a 3200 with a dropped zero -- became clamp(320, 2800, 3400)
+ * == 2800, i.e. one typo silently selecting the most aggressive floor the
+ * module allows, with a brown-out reboot as the failure mode. Out of range is
+ * now a rejection, not a clamp.
+ *
+ * A malformed POSITIONAL token additionally discards the whole positional
+ * sequence, because position is the only thing that gives a bare number its
+ * meaning: in "3200,x,3100" there is no way to know whether 3100 was meant as
+ * empty or as shutdown, so neither is applied. Well-formed-but-out-of-range is
+ * per-value instead -- there the positions are unambiguous, so only the
+ * offending value is dropped. Use the key= form to avoid the question.
+ *
+ * Two passes: the first decides only whether the positional sequence can be
+ * trusted, the second applies. So everything takes effect in the order written
+ * and, for any one parameter, the last mention wins.
+ *
+ * Returns the number of rejected tokens (0 = everything understood).
+ */
+static int set_targets_from_args(const char *args)
+{
+    int pos_n = 0, pos_bad = 0, rejected = 0, pass;
+
+    if (!args)
+        return 0;
+
+    for (pass = 0; pass < 2; pass++) {
+        const char *s;
+
+        if (pass == 1 && pos_bad) {
+            pr_err(LOG_PREFIX "arg: malformed positional value -- cutoff/empty/shutdown ALL left unchanged (use cutoff=/empty=/shutdown= to be explicit)\n");
+            rejected++;
         }
-        if (kw_is(s, "fvss=")) {
-            int v = 0, got = 0;
 
-            s += 5;
-            for (; *s >= '0' && *s <= '9'; s++) { v = v * 10 + (*s - '0'); got = 1; }
-            if (got)
-                fvss_pure = v ? 1 : 0;
-            if (!*s)
-                break;
-            continue;
-        }
-        if (kw_is(s, "lt=")) {
-            int v = 0, got = 0;
+        pos_n = 0;
+        s = args;
+        for (;;) {
+            const char *tok, *end, *eq;
+            char tb[ARG_TOK_MAX];
+            int v, more;
 
-            s += 3;
-            for (; *s >= '0' && *s <= '9'; s++) { v = v * 10 + (*s - '0'); got = 1; }
-            if (got)
-                lt_delta_mv = clamp_i(v, 0, LT_DELTA_MV_MAX);
-            if (!*s)
-                break;
-            continue;
-        }
-        if ((s[0] == 'p' || s[0] == 'P') && (s[1] == 's' || s[1] == 'S') &&
-            (s[2] == 'p' || s[2] == 'P') && s[3] == '=') {
-            int pv = 0, got = 0;
+            while (is_ws(*s))
+                s++;
+            tok = s;
+            while (*s && !is_ws(*s) && !is_delim(*s))
+                s++;
+            end = s;
+            while (is_ws(*s))
+                s++;
 
-            for (s += 4; *s >= '0' && *s <= '9'; s++) {
-                pv = pv * 10 + (*s - '0');
-                got = 1;
+            /*
+             * The field is now fully captured in [tok, end), so consume its
+             * trailing delimiter HERE, once. Every path below can then
+             * `continue` freely: `s` has already advanced, so no branch can
+             * ever fail to make progress. In a kernel module that is worth a
+             * little bookkeeping -- the failure mode of a non-advancing loop
+             * is a hung CPU, not a wrong value.
+             */
+            more = is_delim(*s);
+            if (more)
+                s++;
+
+            if (end == tok) {
+                /*
+                 * An empty field. It consumes its positional slot and sets
+                 * nothing, so "3200,,3100" leaves empty_volt at its current
+                 * value and still puts 3100 in shutdown -- nothing shifts into
+                 * the wrong parameter, which is the entire hazard an empty
+                 * field would otherwise create. A trailing ',' is therefore
+                 * harmless; only running out of string ends the scan.
+                 */
+                if (!more)
+                    break;
+                if (pos_n < 3)
+                    pos_n++;
+                continue;
             }
-            if (got)
-                psp_from_arg = pv;
-            if (!*s)
-                break;
-            continue;               /* *s is a separator; loop's s++ skips it */
-        }
 
-        if (*s >= '0' && *s <= '9') {
-            v = v * 10 + (*s - '0');
-            in = 1;
-        } else if (in) {
-            if (idx < 3)
-                vals[idx++] = v;
-            v = 0;
-            in = 0;
+            for (eq = tok; eq < end && *eq != '='; eq++)
+                ;
+
+            /* ---- bare decimal: positional ---- */
+            if (eq == end) {
+                if (parse_uint(tok, end, &v) != 0) {
+                    pos_bad = 1;       /* pass 0 detects, pass 1 already knows */
+                    continue;
+                }
+                if (pos_bad)
+                    continue;
+                if (pos_n >= 3) {
+                    if (pass == 1) {
+                        tok_copy(tb, sizeof(tb), tok, end);
+                        pr_err(LOG_PREFIX "arg: '%s' is a 4th positional value -- rejected\n", tb);
+                        rejected++;
+                    }
+                    continue;
+                }
+                if (pass == 1) {
+                    if (pos_n == 0)
+                        arg_set("cutoff", v, CUTOFF_MV_MIN, CUTOFF_MV_MAX,
+                                &target_cutoff_mv, &rejected);
+                    else if (pos_n == 1)
+                        arg_set("empty", v, EMPTY_MV_MIN, EMPTY_MV_MAX,
+                                &target_empty_mv, &rejected);
+                    else
+                        arg_set("shutdown", v, SHUTDOWN_MV_MIN, SHUTDOWN_MV_MAX,
+                                &target_shutdown_mv, &rejected);
+                }
+                pos_n++;
+                continue;
+            }
+
+            /* ---- key=value ---- */
+            if (pass != 1)
+                continue;
+
+            tok_copy(tb, sizeof(tb), tok, end);
+
+            if (parse_uint(eq + 1, end, &v) != 0) {
+                pr_err(LOG_PREFIX "arg: '%s' has no plain decimal value -- rejected\n", tb);
+                rejected++;
+                continue;
+            }
+
+            if (key_eq(tok, eq, "cutoff"))
+                arg_set("cutoff", v, CUTOFF_MV_MIN, CUTOFF_MV_MAX,
+                        &target_cutoff_mv, &rejected);
+            else if (key_eq(tok, eq, "empty"))
+                arg_set("empty", v, EMPTY_MV_MIN, EMPTY_MV_MAX,
+                        &target_empty_mv, &rejected);
+            else if (key_eq(tok, eq, "shutdown"))
+                arg_set("shutdown", v, SHUTDOWN_MV_MIN, SHUTDOWN_MV_MAX,
+                        &target_shutdown_mv, &rejected);
+            else if (key_eq(tok, eq, "lt"))
+                arg_set("lt", v, 0, LT_DELTA_MV_MAX, &lt_delta_mv, &rejected);
+            else if (key_eq(tok, eq, "fvss"))
+                arg_set("fvss", v, 0, 1, &fvss_pure, &rejected);
+            else if (key_eq(tok, eq, "psp"))
+                arg_set("psp", v, 0, PSP_MAX, &psp_from_arg, &rejected);
+            else if (key_eq(tok, eq, "sdv")) {
+                /* 0 is not a voltage here, it means "never touch the
+                 * instruction stream"; any other value is a target mV. */
+                if (v == 0)
+                    sdv_from_arg = 0;
+                else
+                    arg_set("sdv", v, SHUTDOWN_MV_MIN, SHUTDOWN_MV_MAX,
+                            &sdv_from_arg, &rejected);
+            } else {
+                pr_err(LOG_PREFIX "arg: unknown key in '%s' -- rejected (known: cutoff empty shutdown lt sdv fvss psp)\n",
+                       tb);
+                rejected++;
+            }
         }
     }
-    if (in && idx < 3)
-        vals[idx++] = v;
 
-    if (idx >= 1) target_cutoff_mv   = clamp_i(vals[0], CUTOFF_MV_MIN,   CUTOFF_MV_MAX);
-    if (idx >= 2) target_empty_mv    = clamp_i(vals[1], EMPTY_MV_MIN,    EMPTY_MV_MAX);
-    if (idx >= 3) target_shutdown_mv = clamp_i(vals[2], SHUTDOWN_MV_MIN, SHUTDOWN_MV_MAX);
+    /*
+     * Every value is individually inside a safe range by now, so an odd
+     * ordering is not dangerous -- but it does mean the cutoff -> shutdown
+     * "hang at 1%" window is inverted or empty, which is almost certainly not
+     * what was intended. Say so rather than silently obeying it.
+     */
+    if (target_shutdown_mv > target_cutoff_mv || target_empty_mv > target_shutdown_mv)
+        pr_info(LOG_PREFIX "arg: note -- expected cutoff >= shutdown >= empty, have %d >= %d >= %d\n",
+                target_cutoff_mv, target_shutdown_mv, target_empty_mv);
+
+    if (rejected)
+        pr_err(LOG_PREFIX "arg: %d token(s) rejected; those parameters keep their previous values\n",
+               rejected);
+
+    return rejected;
 }
 
 static long fg_cutoff_init(const char *args, const char *event, void *__user reserved)
 {
     hook_err_t err;
+    int rejected;
 
-    set_targets_from_args(args);
+    rejected = set_targets_from_args(args);
 
-    pr_info(LOG_PREFIX "init (event=%s, args=%s) cutoff=%d empty=%d shutdown=%d mV\n",
+    /* Effective values, AFTER parsing: whatever a rejected token would have
+     * set is still at its compiled default here, so this line is the truth
+     * about what the module is about to apply. */
+    pr_info(LOG_PREFIX "init (event=%s, args=%s) cutoff=%d empty=%d shutdown=%d mV lt=%d%s\n",
             event ? event : "?", args ? args : "", target_cutoff_mv,
-            target_empty_mv, target_shutdown_mv);
+            target_empty_mv, target_shutdown_mv, lt_delta_mv,
+            rejected ? " [SOME ARGS REJECTED -- see above; defaults kept]" : "");
 
     p_probe_kernel_read = (probe_kernel_read_t)kallsyms_lookup_name("probe_kernel_read");
     if (!p_probe_kernel_read)
@@ -1368,6 +1537,15 @@ static long fg_cutoff_init(const char *args, const char *event, void *__user res
     return 0;
 }
 
+/*
+ * Reported back to userspace so a rejected argument is visible without going
+ * to dmesg -- the values printed alongside it are the ones actually in force.
+ */
+static const char *arg_reject_note(int rejected)
+{
+    return rejected ? " [SOME ARGS REJECTED -- unchanged; see dmesg]" : "";
+}
+
 /* "off" | "armed" (hooked, field not yet identified) | "active". */
 static const char *fvss_state_str(void)
 {
@@ -1379,10 +1557,10 @@ static const char *fvss_state_str(void)
 /* Runtime reconfigure: kpm control battery-fg-cutoff "<cutoff>[,<empty>[,<shutdown>]]" */
 static long fg_cutoff_control0(const char *args, char *__user out_msg, int outlen)
 {
-    char msg[224];
-    int len;
+    char msg[256];
+    int len, rejected;
 
-    set_targets_from_args(args);
+    rejected = set_targets_from_args(args);
 
     if (cutoff_field && chip_ptr) {
         *cutoff_field = eff_cutoff_mv();
@@ -1391,15 +1569,15 @@ static long fg_cutoff_control0(const char *args, char *__user out_msg, int outle
         write_cutoff_sram(chip_ptr, eff_cutoff_mv(), 1);
         write_empty_sram(chip_ptr, eff_empty_mv(), 1);
         len = fmt_msg(msg, (int)sizeof(msg),
-                      "cutoff=%d empty=%d shutdown=%d mV live (stock %d/%d) fvss=%s (%d)\n",
+                      "cutoff=%d empty=%d shutdown=%d mV live (stock %d/%d) fvss=%s (%d)%s\n",
                       eff_cutoff_mv(), eff_empty_mv(), eff_shutdown_mv(),
                       orig_cutoff_mv, orig_empty_mv, fvss_state_str(),
-                      fvss_overrides);
+                      fvss_overrides, arg_reject_note(rejected));
     } else {
         len = fmt_msg(msg, (int)sizeof(msg),
-                      "cutoff=%d empty=%d shutdown=%d mV queued (not yet located) fvss=%s\n",
+                      "cutoff=%d empty=%d shutdown=%d mV queued (not yet located) fvss=%s%s\n",
                       eff_cutoff_mv(), eff_empty_mv(), eff_shutdown_mv(),
-                      fvss_state_str());
+                      fvss_state_str(), arg_reject_note(rejected));
     }
 
     pr_info(LOG_PREFIX "%s", msg);

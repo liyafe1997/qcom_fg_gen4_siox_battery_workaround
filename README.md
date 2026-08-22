@@ -400,6 +400,12 @@ kpm load  /data/local/tmp/fg_cutoff.kpm
 # load with explicit targets "cutoff[,empty[,shutdown]]" (mV) as module args
 kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100"
 
+# ...or name them, in any order — clearer, and immune to a miscounted comma
+kpm load  /data/local/tmp/fg_cutoff.kpm "cutoff=3200,shutdown=3100"
+
+# an empty positional field keeps that one at its current value
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,,3100"   # cutoff + shutdown only
+
 # change targets at runtime (cutoff only, or more)
 kpm control battery-fg-cutoff "3200"
 kpm control battery-fg-cutoff "3200,3000,3100"
@@ -424,8 +430,51 @@ kpm control battery-fg-cutoff "fvss=1"
 kpm unload battery-fg-cutoff
 ```
 
-Clamps: `cutoff` **[2800, 3400]**, `empty` **[2500, 3300]**,
-`shutdown` **[2800, 3300]** mV.
+### Arguments and what happens when they are wrong
+
+Both `kpm load` and `kpm control` take the same string: fields separated by `,`
+or `;` (whitespace is padding). A field is `key=value`, a bare decimal
+(positional, in the order **cutoff, empty, shutdown**), or empty. Keys are
+case-insensitive; for any one parameter the last mention wins.
+
+| key | range | meaning |
+|---|---|---|
+| `cutoff` | 2800–3400 mV | FVSS 0% scale + hardware `msoc=0%` anchor |
+| `empty` | 2500–3300 mV | vbatt-low IRQ threshold |
+| `shutdown` | 2800–3300 mV | effective shutdown floor (end of the hang-at-1% window) |
+| `lt` | 0–200 mV | cold-tier step; `0` disables the shift |
+| `sdv` | `0`, or 2800–3300 mV | countdown threshold; `0` = never patch the instruction stream |
+| `fvss` | `0` or `1` | pure-FVSS SOC (default `1`) |
+| `psp` | 0–255 | force the `POWER_SUPPLY_PROP_CAPACITY` ordinal |
+
+**A value that cannot be parsed and range-checked is rejected, and the parameter
+keeps its current value** — the compiled default at load time, the live value
+from `kpm control`. Nothing is coerced. Every rejection is logged with a reason,
+`kpm control` appends `[SOME ARGS REJECTED …]` to its reply, and the init line
+prints the values actually in force.
+
+This is a **deliberate reversal** of the old clamping behaviour, and the reason
+is worth stating: clamping turned `"320"` — a `3200` with a dropped zero — into
+`clamp(320, 2800, 3400)` = **2800 mV**, so a single typo silently selected the
+most aggressive floor the module allows, with a brown-out reboot as the failure
+mode. Out of range is now a rejection, not a clamp.
+
+A malformed **positional** field additionally discards the whole positional
+sequence, because position is the only thing that gives a bare number its
+meaning: in `"3200,x,3100"` there is no way to know whether `3100` was meant as
+`empty` or as `shutdown`, so neither is applied. Well-formed-but-out-of-range is
+per-value instead — there the positions are unambiguous, so only the offending
+value is dropped. Use `key=` to sidestep the question entirely.
+
+```
+"3200,3000,3100"   all three applied
+"cutoff=3200"      cutoff only; empty and shutdown keep their current values
+"3200,,3100"       empty field = keep empty_volt; 3100 still lands in shutdown
+"320"              rejected (out of range) -> cutoff stays 3200
+"3200,x,3100"      malformed positional -> ALL THREE keep their current values
+"bogus=3300"       unknown key -> rejected
+"3200,lt=999"      cutoff applied; lt rejected (out of range) -> lt stays 100
+```
 
 To make it persistent, load it from a SukiSU/KernelPatch boot service (the same
 place you load other KPMs).
@@ -441,13 +490,23 @@ dmesg | grep fg-cutoff-kpm
 Expected, within a second or two of the first FG voltage poll:
 
 ```
-[fg-cutoff-kpm] init (event=..., args=) cutoff=3200 empty=3000 shutdown=3100 mV
-[fg-cutoff-kpm] syms: pkr=... sram_write=... get_voltage=... get_property=... get_msoc=...
+[fg-cutoff-kpm] init (event=load-file, args=) cutoff=3200 empty=3000 shutdown=3100 mV
+[fg-cutoff-kpm] syms: pkr=ffffffaa07c35df4 sram_write=ffffffaa08617550 sram_read=ffffffaa08616b30 get_voltage=ffffffaa086186a4 get_property=ffffffaa08612af0 get_msoc=ffffffaa086180bc
+[fg-cutoff-kpm] low-temp tier: -100 mV, mirroring is_low_temp_flag=ffffffaa0ac0afd7 (driver decides when cold)
+[fg-cutoff-kpm] psp: CAPACITY=44 (by name, stride 32)
+[fg-cutoff-kpm] SDV scan: fg_psy_get_property=ffffffaa08612af0 size=1528
+[fg-cutoff-kpm] SDV   +0x0518  insn=52818389  MOVZ imm=3100  <== SHUTDOWN_DELAY_VOL_lOW_TEMP
+[fg-cutoff-kpm] SDV   +0x0524  insn=52819c88  MOVZ imm=3300  <== SHUTDOWN_DELAY_VOL
+[fg-cutoff-kpm] SDV scan done: 2 in range, 3300 x1, 3100 x1
+[fg-cutoff-kpm] SDV verified @ffffffaa08613014: 52819c88 -> 52818388 (imm 3300 -> 3100)
+[fg-cutoff-kpm] SDV verified @ffffffaa08613008: 52818389 -> 52817709 (imm 3100 -> 3000)
+[fg-cutoff-kpm] SDV active: countdown threshold 3100 mV warm, cold follows lt=
 [fg-cutoff-kpm] pure FVSS armed; msoc_actual is identified on the first FVSS tick
 [fg-cutoff-kpm] hooks installed; applying on next FG voltage read
+[fg-cutoff-kpm] dt located @+0x6cc (SRAM cutoff 3399 mV confirms)
 [fg-cutoff-kpm] SRAM CUTOFF_VOLT <- 3200 mV (raw 33 33) rc=0
 [fg-cutoff-kpm] SRAM VBATT_LOW  <- 3000 mV (raw 40) rc=0
-[fg-cutoff-kpm] applied: cutoff 3400->3200, empty 3100->3000, shutdown floor 3100 mV (dt @ ...)
+[fg-cutoff-kpm] applied: cutoff 3400->3200, empty 3100->3000, shutdown floor 3100 mV (dt @ ffffffedb728e74c)
 ```
 
 If `get_property=0000...` (symbol not found), cutoff/empty still apply but the
@@ -513,7 +572,8 @@ build:
 - **Safety.** Do not set the floor below the cell's real spec or the PMIC UVLO.
   Over-discharge damages cells; too low a floor risks brown-out/reboot under
   load (the cell sags below system-min). Validate the aggressive end on-device
-  at high load and cold temperature. Clamp floors: cutoff 2800, empty 2500 mV.
+  at high load and cold temperature. The accepted floors stop at cutoff 2800 /
+  empty 2500 mV — anything lower is rejected outright, not clamped to the limit.
 - Verified against the FG-Gen4 driver in this tree
   (`drivers/power/supply/qcom/qpnp-fg-gen4.c`, `fg-util.c`, `fg-core.h`) on
   `lmi` / kernel 4.19.325.
@@ -853,6 +913,12 @@ kpm load  /data/local/tmp/fg_cutoff.kpm
 # 以模块参数 "cutoff[,empty[,shutdown]]"（mV）显式指定目标加载
 kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100"
 
+# ……也可以按名字给，顺序随意——更清晰，也不怕逗号数错
+kpm load  /data/local/tmp/fg_cutoff.kpm "cutoff=3200,shutdown=3100"
+
+# 位置参数留空表示「这一项保持当前值」
+kpm load  /data/local/tmp/fg_cutoff.kpm "3200,,3100"   # 只改 cutoff 和 shutdown
+
 # 运行时修改目标（仅 cutoff，或更多）
 kpm control battery-fg-cutoff "3200"
 kpm control battery-fg-cutoff "3200,3000,3100"
@@ -877,7 +943,45 @@ kpm control battery-fg-cutoff "fvss=1"
 kpm unload battery-fg-cutoff
 ```
 
-限幅：`cutoff` **[2800, 3400]**、`empty` **[2500, 3300]**、`shutdown` **[2800, 3300]** mV。
+### 参数格式，以及写错时会发生什么
+
+`kpm load` 和 `kpm control` 接受同一种字符串：字段之间用 `,` 或 `;` 分隔（空白只是填充）。
+每个字段可以是 `key=value`、一个纯十进制数（位置参数，顺序为 **cutoff、empty、shutdown**），
+或者留空。key 不区分大小写；同一个参数被提到多次时，以最后一次为准。
+
+| key | 取值范围 | 含义 |
+|---|---|---|
+| `cutoff` | 2800–3400 mV | FVSS 0% 标度 + 硬件 `msoc=0%` 锚点 |
+| `empty` | 2500–3300 mV | vbatt-low 中断阈值 |
+| `shutdown` | 2800–3300 mV | 有效关机地板（挂在 1% 那段窗口的终点） |
+| `lt` | 0–200 mV | 低温档步长；`0` 关闭下移 |
+| `sdv` | `0`，或 2800–3300 mV | 倒计时阈值；`0` 表示绝不改写指令流 |
+| `fvss` | `0` 或 `1` | 纯 FVSS SOC（默认 `1`） |
+| `psp` | 0–255 | 强制指定 `POWER_SUPPLY_PROP_CAPACITY` 序号 |
+
+**凡是无法解析、或超出范围的值一律被拒绝，对应参数保持当前值**——加载时是编译进去的默认值，
+`kpm control` 时是当前生效的值。不做任何静默折中。每一次拒绝都会带原因写进内核日志，
+`kpm control` 的回显会追加 `[SOME ARGS REJECTED …]`，init 那行则打印真正生效的值。
+
+这是对旧行为（超范围就**截断**）的一次**刻意反转**，理由值得写清楚：截断会把 `"320"`
+——也就是少打一个零的 `3200`——变成 `clamp(320, 2800, 3400)` = **2800 mV**，
+于是一个笔误就静默选中了模块允许的最激进地板，而它的失败模式是掉电重启。
+所以现在超出范围是**拒绝**，不是截断。
+
+另外，**位置参数**只要有一个格式错误，整组位置参数都会作废——因为位置是纯数字唯一的含义来源：
+`"3200,x,3100"` 里没法判断 `3100` 想给的是 `empty` 还是 `shutdown`，于是两者都不应用。
+而「格式正确但超范围」是逐个处理的——那时位置是明确的，所以只丢掉出问题的那一个。
+用 `key=` 形式可以彻底绕开这个问题。
+
+```
+"3200,3000,3100"   三个都生效
+"cutoff=3200"      只改 cutoff；empty 和 shutdown 保持当前值
+"3200,,3100"       空字段 = 保持 empty_volt；3100 仍然落在 shutdown 上
+"320"              被拒（超范围）-> cutoff 保持 3200
+"3200,x,3100"      位置参数格式错误 -> 三个全部保持当前值
+"bogus=3300"       未知 key -> 被拒
+"3200,lt=999"      cutoff 生效；lt 被拒（超范围）-> lt 保持 100
+```
 
 若要持久化，请在 SukiSU/KernelPatch 的开机服务里加载它（和你加载其它 KPM 的地方一样）。
 
@@ -889,16 +993,26 @@ kpm unload battery-fg-cutoff
 dmesg | grep fg-cutoff-kpm
 ```
 
-在首次 FG 电压轮询后一两秒内，预期看到：
+模块加载后，在首次 FG 电压轮询后一两秒内，可以看看dmesg，如果看到：
 
 ```
-[fg-cutoff-kpm] init (event=..., args=) cutoff=3200 empty=3000 shutdown=3100 mV
-[fg-cutoff-kpm] syms: pkr=... sram_write=... get_voltage=... get_property=... get_msoc=...
+[fg-cutoff-kpm] init (event=load-file, args=) cutoff=3200 empty=3000 shutdown=3100 mV
+[fg-cutoff-kpm] syms: pkr=ffffffaa07c35df4 sram_write=ffffffaa08617550 sram_read=ffffffaa08616b30 get_voltage=ffffffaa086186a4 get_property=ffffffaa08612af0 get_msoc=ffffffaa086180bc
+[fg-cutoff-kpm] low-temp tier: -100 mV, mirroring is_low_temp_flag=ffffffaa0ac0afd7 (driver decides when cold)
+[fg-cutoff-kpm] psp: CAPACITY=44 (by name, stride 32)
+[fg-cutoff-kpm] SDV scan: fg_psy_get_property=ffffffaa08612af0 size=1528
+[fg-cutoff-kpm] SDV   +0x0518  insn=52818389  MOVZ imm=3100  <== SHUTDOWN_DELAY_VOL_lOW_TEMP
+[fg-cutoff-kpm] SDV   +0x0524  insn=52819c88  MOVZ imm=3300  <== SHUTDOWN_DELAY_VOL
+[fg-cutoff-kpm] SDV scan done: 2 in range, 3300 x1, 3100 x1
+[fg-cutoff-kpm] SDV verified @ffffffaa08613014: 52819c88 -> 52818388 (imm 3300 -> 3100)
+[fg-cutoff-kpm] SDV verified @ffffffaa08613008: 52818389 -> 52817709 (imm 3100 -> 3000)
+[fg-cutoff-kpm] SDV active: countdown threshold 3100 mV warm, cold follows lt=
 [fg-cutoff-kpm] pure FVSS armed; msoc_actual is identified on the first FVSS tick
 [fg-cutoff-kpm] hooks installed; applying on next FG voltage read
+[fg-cutoff-kpm] dt located @+0x6cc (SRAM cutoff 3399 mV confirms)
 [fg-cutoff-kpm] SRAM CUTOFF_VOLT <- 3200 mV (raw 33 33) rc=0
 [fg-cutoff-kpm] SRAM VBATT_LOW  <- 3000 mV (raw 40) rc=0
-[fg-cutoff-kpm] applied: cutoff 3400->3200, empty 3100->3000, shutdown floor 3100 mV (dt @ ...)
+[fg-cutoff-kpm] applied: cutoff 3400->3200, empty 3100->3000, shutdown floor 3100 mV (dt @ ffffffedb728e74c)
 ```
 
 若 `get_property=0000...`（符号未找到），cutoff/empty 仍会应用，但关机地板保持原厂 3300 mV。
@@ -947,7 +1061,7 @@ dmesg | grep fg-cutoff-kpm
   在你关心的最低温度下**带载**实测验证过再信任 `lt=`；失败模式是掉电重启，而不是干净关机。
 - **安全。** 不要把地板设到低于电芯真实规格或 PMIC UVLO。过放会损伤电芯；地板过低有在负载下
   掉压/重启的风险（电芯被拉到系统最低电压以下）。请在设备上以高负载和低温验证激进的下限。
-  限幅地板：cutoff 2800、empty 2500 mV。
+  允许的地板下限是 cutoff 2800 / empty 2500 mV——再低会被直接拒绝，而不是截断到该下限。
 - 已针对本树的 FG-Gen4 驱动验证
   （`drivers/power/supply/qcom/qpnp-fg-gen4.c`、`fg-util.c`、`fg-core.h`），
   机型 `lmi` / 内核 4.19.325。
