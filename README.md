@@ -5,8 +5,10 @@
 A [SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra) / [KernelPatch](https://github.com/bmax121/KernelPatch)
 **KPM** (Kernel Patch Module) that lowers the Qualcomm **QPNP FG-Gen4**
 fuel-gauge discharge **floor** — cutoff `3400→3200`, empty `3100→3000`, and the
-*effective shutdown voltage* `3300→3100` — entirely at runtime, in kernel space,
-with **no kernel source edits**.
+*effective shutdown voltage* `3300→3100` — and makes the driver report the
+**voltage-derived SOC it already computes** in the sub-3.6 V tail instead of
+letting the gauge's graphite-profile `msoc` veto it — entirely at runtime, in
+kernel space, with **no kernel source edits**.
 
 **Applicability.** Developed and verified on the **Redmi K30 Pro (codename
 `lmi`)**, and should apply to any device whose kernel drives its fuel gauge with
@@ -42,6 +44,7 @@ edits:**
 | `empty_volt_mv` | 3100 | **3000** | vbatt-low IRQ threshold → arms rapid-SOC | DT field write + SRAM word 35 |
 | `SHUTDOWN_DELAY_VOL` | 3300 | **3100** | the **true** shutdown voltage, and the 30 s warning | `hotpatch()` on its MOVZ + hook on `fg_psy_get_property` |
 | `VBAT_CRITICAL_LOW_THR` | 2800 | *(left stock)* | rapid-SOC immediate-trip floor | **subsumed** by the shutdown hook |
+| FVSS reported SOC | HW-`msoc`-vetoed | **pure voltage** | what the tail below 3600 mV actually shows | hook on `fg_get_msoc` — see [Pure FVSS](#pure-fvss--report-the-voltage-soc-the-driver-already-computes) |
 
 Two DT-field parameters are written directly (they are the **root of truth** —
 on any FG profile reload the driver re-derives the SRAM anchors from them — and
@@ -184,10 +187,93 @@ Where the driver does manage cutoff, the KPM wins the race simply by
 re-asserting on every voltage read — far more often than the driver's 10 s
 monitor tick — and re-asserts SRAM too, not just the C field.
 
+## Pure FVSS — report the voltage SOC the driver already computes
+
+Lowering the floors buys the tail. This makes the phone actually *count* it.
+
+Below **3600 mV** (3400 when the driver says cold) the driver enters **FVSS**
+(Fast Voltage Slope Scaling): it stops trusting the gauge's coulomb counter and
+derives SOC linearly from filtered voltage instead —
+
+```
+soc = (vbatt_avg - dt.cutoff_volt_mv) / soc_scale_slope
+```
+
+— which is exactly what we want on a Si/C cell, because the profile programmed
+into the gauge is still the stock graphite one. But `soc_scale_work()` does not
+report that value unconditionally. Its **first** branch is a veto:
+
+```c
+if ((prev_soc_scale_msoc - msoc_actual) > soc_thr_percent)   /* thr = 1% */
+        soc_scale_msoc = prev_soc_scale_msoc - soc_thr_percent;
+```
+
+*Whenever the voltage SOC sits more than 1% **above** the hardware `msoc`, throw
+the voltage away and step down 1% per tick.* Feeding a graphite profile from a
+Si/C cell keeps that true for the **entire** tail, so the display is walked down
+to the gauge's pessimistic `msoc`, hits 1% early, and then sits there for a long
+time while the cell still holds a large usable reserve. That is the "stuck at 1%
+for an hour" symptom, and no amount of floor-lowering fixes it — the floors
+decide when 0% happens, this decides what is shown on the way there.
+
+**The fix.** `chip->msoc_actual` has exactly **one writer**
+(`fg_gen4_validate_soc_scale_mode`) and exactly **two readers**: the veto above,
+and the charging-side FVSS exit test `msoc_actual >= soc_scale_msoc`. Nothing
+else in the driver touches it. So the KPM hooks `fg_get_msoc()` and, **only for
+the single call that fills that field**, hands back `prev_soc_scale_msoc`:
+
+| | effect |
+|---|---|
+| veto branch | `prev - msoc_actual == 0`, so it can never fire again |
+| what is reported | the driver's own voltage SOC, with its own smoothing: never rises, and a fast voltage drop is still rate-limited to 1% per tick |
+| plugging in | the exit test is now immediately true, so FVSS exits at once — **better than stock**: `fg_gen4_exit_soc_scale()` programs the scaled SOC into the hardware `MONOTONIC_SOC` register on the way out, so the displayed value carries over seamlessly and then climbs with the charge, instead of freezing until an inaccurate `msoc` catches up |
+| outside FVSS | **nothing changes** — `msoc_actual` has no other consumer, and every other `fg_get_msoc()` caller (including the one behind `POWER_SUPPLY_PROP_CAPACITY` when FVSS is off) passes a stack local the identification rejects |
+
+### Identifying the field without a struct offset
+
+The KPM never hard-codes an offset. It reads the seven ints around the pointer
+the driver just passed and requires the whole neighbourhood to check out:
+
+| | field | test |
+|---|---|---|
+| −3 | `soc_scale_msoc` | 0–100 |
+| −2 | `prev_soc_scale_msoc` | 0–100 — **the value written back** |
+| −1 | `soc_scale_slope` | **> 0** (only true once FVSS has been entered) |
+| 0 | `msoc_actual` | 0–100 — the target |
+| +1 | `vbatt_avg` | plausible mV |
+| +2 | `vbatt_now` | plausible mV |
+| +3 | `vbatt_res` | **exactly** `vbatt_avg - cutoff_volt_mv` |
+
+The last row is the real fingerprint: the caller runs
+`fg_gen4_get_prop_soc_scale()` immediately beforehand, which ends by computing
+that identity — an exact arithmetic relation between three words we can read,
+**anchored on the cutoff value this module itself wrote**. Same spirit as the
+SRAM cross-check that locates the dt block, and again with no per-device
+constant of our own. (The ordering is what makes the anchor sound:
+`fg_gen4_get_prop_soc_scale()` calls `fg_get_battery_voltage()` — where hook 1
+re-asserts our cutoff — *before* it computes `vbatt_res`.)
+
+Requiring `slope > 0` means the field is confirmed on the first tick where the
+veto could actually fire, never on a zeroed struct. A tick that fails any test
+simply does not confirm and the next one is tried, so losing a race against
+another CPU costs nothing. Once identified the offset is pinned; a second
+in-object address would mean the identification was wrong, and the module
+refuses rather than guesses.
+
+### What this does *not* fix
+
+The FVSS **entry** SOC still comes from the gauge:
+`fg_gen4_enter_soc_scale()` seeds `soc_scale_msoc` from the currently reported
+capacity and derives the slope from it. So the tail is now spread **evenly**
+from wherever the gauge thought you were at 3600 mV down to cutoff — no early
+collapse, no hour at 1% — but that entry point is still profile-dependent.
+Correcting it means replacing the battery profile, which is a different job from
+moving the floors. `fvss=0` opts out and restores the stock veto.
+
 ## How it works (device-independent)
 
 KPMs run in kernel space and can inline-hook kernel functions. This module
-installs two hooks:
+installs three hooks:
 
 **Hook 1 — `fg_get_battery_voltage(struct fg_dev *fg, int *val)`** (locate +
 apply cutoff/empty):
@@ -222,8 +308,14 @@ apply cutoff/empty):
 hook that, for `psp == POWER_SUPPLY_PROP_CAPACITY` returning 0, reports 1% while
 vbatt is above the floor (see the table above).
 
+**Hook 3 — `fg_get_msoc(struct fg_dev *fg, int *msoc)`** (pure FVSS): an AFTER
+hook that rewrites the result **only** when the destination pointer is
+`&chip->msoc_actual`, identified by the arithmetic identity described in
+[Pure FVSS](#pure-fvss--report-the-voltage-soc-the-driver-already-computes).
+Every other caller passes a stack local and is left alone.
+
 Symbols (`probe_kernel_read`, `fg_sram_write`, `fg_sram_read`,
-`fg_get_battery_voltage`, `fg_psy_get_property`) are resolved via
+`fg_get_battery_voltage`, `fg_psy_get_property`, `fg_get_msoc`) are resolved via
 `kallsyms_lookup_name`.
 
 `POWER_SUPPLY_PROP_CAPACITY` is an enum ordinal that shifts between trees, so it
@@ -323,6 +415,11 @@ kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,lt=0"    # disable the s
 kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,sdv=3050" # explicit
 kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,sdv=0"    # never patch code
 
+# pure FVSS: default on. "fvss=0" restores the stock HW-msoc veto; it is a live
+# gate, so `kpm control` can flip it back and forth without unloading
+kpm load    /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,fvss=0"
+kpm control battery-fg-cutoff "fvss=1"
+
 # unload (restores stock cutoff 3400 / empty 3100; shutdown hook removed)
 kpm unload battery-fg-cutoff
 ```
@@ -345,7 +442,8 @@ Expected, within a second or two of the first FG voltage poll:
 
 ```
 [fg-cutoff-kpm] init (event=..., args=) cutoff=3200 empty=3000 shutdown=3100 mV
-[fg-cutoff-kpm] syms: pkr=... sram_write=... get_voltage=... get_property=...
+[fg-cutoff-kpm] syms: pkr=... sram_write=... get_voltage=... get_property=... get_msoc=...
+[fg-cutoff-kpm] pure FVSS armed; msoc_actual is identified on the first FVSS tick
 [fg-cutoff-kpm] hooks installed; applying on next FG voltage read
 [fg-cutoff-kpm] SRAM CUTOFF_VOLT <- 3200 mV (raw 33 33) rc=0
 [fg-cutoff-kpm] SRAM VBATT_LOW  <- 3000 mV (raw 40) rc=0
@@ -354,6 +452,22 @@ Expected, within a second or two of the first FG voltage poll:
 
 If `get_property=0000...` (symbol not found), cutoff/empty still apply but the
 shutdown floor stays at the stock 3300 mV.
+
+**Pure FVSS confirms itself later** — only once the pack actually discharges
+below 3600 mV and the driver enters FVSS:
+
+```
+[fg-cutoff-kpm] FVSS: msoc_actual located @chip+0x... ; HW msoc no longer vetoes the voltage SOC
+[fg-cutoff-kpm] FVSS: HW msoc 3 ignored, keeping voltage SOC 11 (vbatt avg 3520 mV)
+```
+
+`kpm control battery-fg-cutoff ""` reports its live state — `fvss=active (N)`
+once the field is identified (`N` = number of overrides so far), `fvss=armed`
+while still waiting for the first FVSS tick, `fvss=off` if disabled or the
+symbol was missing. Cross-check against the driver's own FVSS log lines
+(`Calculated SOC=... SOC reported=...`, `msoc_actual: ...`): with the KPM active,
+`msoc_actual` in those lines tracks the reported scale SOC instead of the
+gauge's own falling value.
 
 You can cross-check the live SRAM values if `CONFIG_DEBUG_FS` is enabled on your
 build:
@@ -385,6 +499,13 @@ build:
   graphite) profile run further down the curve; it does **not** correct the
   percentage curve shape for a Si/C cell. For accurate mid-range SOC you still
   need a matching `fg-profile-data`.
+- **Pure FVSS fixes the tail's *shape*, not its *start*.** The FVSS entry SOC is
+  still seeded from the gauge, so if the graphite profile already reads low at
+  3600 mV, the tail is spread evenly from that low number down to cutoff rather
+  than collapsing — the hour parked at 1% goes away, but the entry percentage
+  itself is still profile-dependent. Also note the deliberate consequence that
+  FVSS now exits the moment you plug in (the display carries over via
+  `MONOTONIC_SOC`, so this is seamless, but it *is* a behaviour change).
 - **The cold tier is the least validated part.** The right step depends on your
   cell's actual DCIR at temperature, which varies by pack. Validate `lt=` at the
   coldest temperature you care about *under load* before trusting it; the
@@ -410,6 +531,8 @@ GPL-2.0-or-later (matches the Linux kernel and KernelPatch).
 一个 [SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra) / [KernelPatch](https://github.com/bmax121/KernelPatch)
 的 **KPM**（Kernel Patch Module），用于降低高通 **QPNP FG-Gen4** 电量计的放电**地板**
 ——cutoff `3400→3200`、empty `3100→3000`、以及*有效关机电压* `3300→3100`——
+并且让驱动在 3.6 V 以下的尾段直接上报**它自己已经算出来的电压 SOC**，
+而不再让电量计基于石墨曲线的 `msoc` 把它否决掉——
 全部在运行时于内核态完成，**不改任何内核源码**。
 
 **适用范围。** 在 **红米 K30 Pro（代号 `lmi`）** 上开发并验证，同时应该适用于**其它使用
@@ -439,6 +562,7 @@ GPL-2.0-or-later (matches the Linux kernel and KernelPatch).
 | `empty_volt_mv` | 3100 | **3000** | vbatt-low 中断阈值 → 触发 rapid-SOC | 写 DT 字段 + SRAM word 35 |
 | `SHUTDOWN_DELAY_VOL` | 3300 | **3100** | **真正的**关机电压，以及那 30 秒警告 | `hotpatch()` 改其 MOVZ + hook `fg_psy_get_property` |
 | `VBAT_CRITICAL_LOW_THR` | 2800 | *（保持原厂）* | rapid-SOC 立即触发地板 | 被关机 hook **一并覆盖** |
+| FVSS 上报 SOC | 被硬件 `msoc` 否决 | **纯电压** | 3600 mV 以下尾段实际显示的数字 | hook `fg_get_msoc`——见[纯 FVSS](#纯-fvss上报驱动自己算好的电压-soc) |
 
 两个 DT 字段参数直接写入（它们是**真值之源**——每次 FG profile 重载时驱动都会从它们重新推导
 SRAM 锚点——同时 KPM 也写 SRAM，使改动立即生效）。
@@ -550,9 +674,78 @@ KPM **没有自己的温度阈值**。它镜像驱动的 `is_low_temp_flag`（�
 在驱动确实会管 cutoff 的机型上，KPM 靠「每次读电压都重新写回」赢下这场竞争——频率远高于驱动
 10 秒一次的 monitor tick——而且连 SRAM 一起写回，不只是 C 字段。
 
+## 纯 FVSS：上报驱动自己算好的电压 SOC
+
+降低地板买到了那条尾巴，这一节让手机真正把它**数出来**。
+
+在 **3600 mV** 以下（驱动判定为冷时是 3400），驱动会进入 **FVSS**（Fast Voltage Slope
+Scaling）：它不再相信电量计的库仑计，改为按滤波后的电压线性推算 SOC——
+
+```
+soc = (vbatt_avg - dt.cutoff_volt_mv) / soc_scale_slope
+```
+
+——这正是硅碳电池上我们想要的，因为烧进电量计的仍然是原厂那条石墨曲线。但
+`soc_scale_work()` 并不会无条件上报这个值，它的**第一个**分支是一票否决：
+
+```c
+if ((prev_soc_scale_msoc - msoc_actual) > soc_thr_percent)   /* thr = 1% */
+        soc_scale_msoc = prev_soc_scale_msoc - soc_thr_percent;
+```
+
+*只要电压算出的 SOC 比硬件 `msoc` **高**出超过 1%，就把电压结果丢掉，改成每个 tick 硬扣 1%。*
+用石墨曲线去跑硅碳电芯，这个条件在**整条**尾巴上都成立，于是显示值被一路拖到电量计那个
+悲观的 `msoc`，提前掉到 1%，然后在电芯还剩一大截可用电量的情况下长时间停在那里——这就是
+「1% 能用一个小时」的由来。光降地板治不了它：**地板决定 0% 何时发生，这里决定在到达之前显示什么**。
+
+**做法。** `chip->msoc_actual` 全驱动只有**一个写入者**
+（`fg_gen4_validate_soc_scale_mode`），也只有**两个读取者**：上面那个否决分支，以及充电侧的
+FVSS 退出判断 `msoc_actual >= soc_scale_msoc`。驱动里再没有别的地方碰它。所以 KPM hook
+`fg_get_msoc()`，并且**只对填充该字段的那一次调用**返回 `prev_soc_scale_msoc`：
+
+| | 效果 |
+|---|---|
+| 否决分支 | `prev - msoc_actual == 0`，永远不再触发 |
+| 实际上报 | 驱动自己的电压 SOC，且保留它自己的平滑：只降不升，电压快速下跌时仍限速 1%/tick |
+| 插上充电 | 退出判断立刻成立，于是马上退出 FVSS——这**比原版更好**：`fg_gen4_exit_soc_scale()` 在退出路径上会把标度 SOC 写进硬件 `MONOTONIC_SOC` 寄存器，因此显示值无缝衔接、随充电上升，而不是冻结着等不准的 `msoc` 慢慢追上来 |
+| FVSS 之外 | **毫无变化**——`msoc_actual` 没有别的消费者，而 `fg_get_msoc()` 的其它调用者（包括 FVSS 关闭时 `POWER_SUPPLY_PROP_CAPACITY` 背后的那次）传的都是栈上局部变量，会被识别逻辑拒掉 |
+
+### 不靠结构体偏移来识别这个字段
+
+KPM 里不写死任何偏移。它读取驱动刚传进来的那个指针周围的七个 int，要求整片邻域都对得上：
+
+| | 字段 | 判据 |
+|---|---|---|
+| −3 | `soc_scale_msoc` | 0–100 |
+| −2 | `prev_soc_scale_msoc` | 0–100——**写回去的就是它** |
+| −1 | `soc_scale_slope` | **> 0**（只有进入过 FVSS 才成立） |
+| 0 | `msoc_actual` | 0–100——目标字段 |
+| +1 | `vbatt_avg` | 合理电压 mV |
+| +2 | `vbatt_now` | 合理电压 mV |
+| +3 | `vbatt_res` | **精确等于** `vbatt_avg - cutoff_volt_mv` |
+
+最后一行才是真正的指纹：调用方在此之前刚跑完 `fg_gen4_get_prop_soc_scale()`，而它的最后
+一步正是计算这个恒等式——三个我们能读到的字之间的精确算术关系，而且**锚定在本模块自己写进去
+的 cutoff 值上**。这与定位 dt 块时用的 SRAM 交叉校验是同一思路，同样不引入任何机型相关常量。
+（顺序是这个锚点成立的关键：`fg_gen4_get_prop_soc_scale()` 是先调用 `fg_get_battery_voltage()`
+——hook 1 在那里重新写回我们的 cutoff——**之后**才计算 `vbatt_res` 的。）
+
+要求 `slope > 0`，意味着字段会在「否决分支真正可能触发」的第一个 tick 上被确认，而绝不会
+在一个全零、从未使用过的结构体上被误认。任何一个 tick 只要有一项判据不过，就干脆不确认、
+等下一个 tick 再试，因此输掉一次与其它 CPU 的竞争不会有任何代价。一旦识别成功，偏移就被钉死；
+若之后出现第二个落在对象内的地址，说明识别本身有问题，模块选择拒绝而不是猜测。
+
+### 它*治不了*什么
+
+FVSS 的**进入 SOC** 仍然来自电量计：`fg_gen4_enter_soc_scale()` 用当前上报的电量作为
+`soc_scale_msoc` 的起点，斜率也由它推出。所以现在这条尾巴是从「电量计在 3600 mV 时认为的那个
+数字」**均匀地**铺到 cutoff——不再提前崩塌，也不再有停在 1% 的那一小时——但那个起点值本身
+仍然取决于电池曲线。要修它就得换电池 profile，那是与挪地板不同的另一件事。用 `fvss=0`
+可以退出本功能、恢复原厂的否决逻辑。
+
 ## 工作原理（与机型无关）
 
-KPM 运行在内核态，可以对内核函数做 inline hook。本模块安装两个 hook：
+KPM 运行在内核态，可以对内核函数做 inline hook。本模块安装三个 hook：
 
 **Hook 1 —— `fg_get_battery_voltage(struct fg_dev *fg, int *val)`**（定位 + 应用 cutoff/empty）：
 
@@ -581,8 +774,13 @@ KPM 运行在内核态，可以对内核函数做 inline hook。本模块安装�
 **Hook 2 —— `fg_psy_get_property(psy, psp, val)`**（关机地板）：一个 AFTER hook，当
 `psp == POWER_SUPPLY_PROP_CAPACITY` 返回 0 时，在 vbatt 高于地板期间报告 1%（见上表）。
 
+**Hook 3 —— `fg_get_msoc(struct fg_dev *fg, int *msoc)`**（纯 FVSS）：一个 AFTER hook，
+**仅当**目标指针是 `&chip->msoc_actual` 时改写返回结果，该字段由
+[纯 FVSS](#纯-fvss上报驱动自己算好的电压-soc) 一节所述的算术恒等式识别。
+其它调用者传的都是栈上局部变量，一概不动。
+
 符号（`probe_kernel_read`、`fg_sram_write`、`fg_sram_read`、`fg_get_battery_voltage`、
-`fg_psy_get_property`）通过 `kallsyms_lookup_name` 解析。
+`fg_psy_get_property`、`fg_get_msoc`）通过 `kallsyms_lookup_name` 解析。
 
 `POWER_SUPPLY_PROP_CAPACITY` 是一个会随内核树变化的枚举序号，因此它**在运行时按名字解析**，
 而不是写死：内核的 `power_supply_attrs[]` 表正是以该枚举为下标，且每个条目以
@@ -670,6 +868,11 @@ kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,lt=0"    # 关闭下移
 kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,sdv=3050" # 指定
 kpm load  /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,sdv=0"    # 绝不改指令
 
+# 纯 FVSS：默认开启。"fvss=0" 恢复原厂的硬件 msoc 否决逻辑；它是运行时开关，
+# 因此可以用 `kpm control` 随时来回切换，无需卸载
+kpm load    /data/local/tmp/fg_cutoff.kpm "3200,3000,3100,fvss=0"
+kpm control battery-fg-cutoff "fvss=1"
+
 # 卸载（恢复原厂 cutoff 3400 / empty 3100；移除关机 hook）
 kpm unload battery-fg-cutoff
 ```
@@ -690,7 +893,8 @@ dmesg | grep fg-cutoff-kpm
 
 ```
 [fg-cutoff-kpm] init (event=..., args=) cutoff=3200 empty=3000 shutdown=3100 mV
-[fg-cutoff-kpm] syms: pkr=... sram_write=... get_voltage=... get_property=...
+[fg-cutoff-kpm] syms: pkr=... sram_write=... get_voltage=... get_property=... get_msoc=...
+[fg-cutoff-kpm] pure FVSS armed; msoc_actual is identified on the first FVSS tick
 [fg-cutoff-kpm] hooks installed; applying on next FG voltage read
 [fg-cutoff-kpm] SRAM CUTOFF_VOLT <- 3200 mV (raw 33 33) rc=0
 [fg-cutoff-kpm] SRAM VBATT_LOW  <- 3000 mV (raw 40) rc=0
@@ -698,6 +902,19 @@ dmesg | grep fg-cutoff-kpm
 ```
 
 若 `get_property=0000...`（符号未找到），cutoff/empty 仍会应用，但关机地板保持原厂 3300 mV。
+
+**纯 FVSS 的确认会晚一些出现**——要等电池真的放到 3600 mV 以下、驱动进入 FVSS 之后：
+
+```
+[fg-cutoff-kpm] FVSS: msoc_actual located @chip+0x... ; HW msoc no longer vetoes the voltage SOC
+[fg-cutoff-kpm] FVSS: HW msoc 3 ignored, keeping voltage SOC 11 (vbatt avg 3520 mV)
+```
+
+`kpm control battery-fg-cutoff ""` 会回报实时状态：字段识别成功后是 `fvss=active (N)`
+（`N` 为已改写次数），还在等第一个 FVSS tick 时是 `fvss=armed`，被关闭或符号缺失时是 `fvss=off`。
+也可以和驱动自己的 FVSS 日志（`Calculated SOC=... SOC reported=...`、`msoc_actual: ...`）
+对照着看：KPM 生效时，那些行里的 `msoc_actual` 会跟随上报的标度 SOC，而不再是电量计自己
+一路下滑的值。
 
 如果你的构建启用了 `CONFIG_DEBUG_FS`，可以交叉核对实时 SRAM 值：
 
@@ -721,6 +938,11 @@ dmesg | grep fg-cutoff-kpm
   斜率/cutoff-current，而这会在充电时自恢复。）
 - **这不是电池 profile。** 降低地板让现有的（4700 mAh 石墨）profile 沿曲线跑得更深；它**不会**
   为硅碳电芯修正百分比曲线的形状。要获得准确的中段 SOC，仍需一份匹配的 `fg-profile-data`。
+- **纯 FVSS 修的是尾巴的*形状*，不是它的*起点*。** FVSS 的进入 SOC 仍然由电量计给出，
+  所以如果石墨曲线在 3600 mV 时读数已经偏低，这条尾巴只是从那个偏低的数字均匀铺到 cutoff，
+  而不会崩塌——停在 1% 的那一小时会消失，但进入时的百分比本身仍取决于电池曲线。另外请注意
+  一个刻意为之的副作用：现在一插上充电就会立刻退出 FVSS（显示值通过 `MONOTONIC_SOC` 无缝
+  衔接，所以观感上没有跳变，但它*确实*是一处行为变化）。
 - **低温档是验证最少的部分。** 合适的步长取决于你这颗电芯在对应温度下的真实 DCIR，各家电池不同。
   在你关心的最低温度下**带载**实测验证过再信任 `lt=`；失败模式是掉电重启，而不是干净关机。
 - **安全。** 不要把地板设到低于电芯真实规格或 PMIC UVLO。过放会损伤电芯；地板过低有在负载下

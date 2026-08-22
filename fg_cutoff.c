@@ -10,6 +10,7 @@
  *     cutoff_volt_mv        : 3400 -> 3200   (dt field + SRAM CUTOFF_VOLT)
  *     empty_volt_mv         : 3100 -> 3000   (dt field + SRAM VBATT_LOW)
  *     SHUTDOWN_DELAY_VOL eff : 3300 -> 3100   (functional hook, see below)
+ *     FVSS reported SOC     : HW-msoc-vetoed -> pure voltage (functional hook)
  *
  * Why a hook for SHUTDOWN_DELAY_VOL instead of patching the #define:
  *   The effective shutdown voltage is SHUTDOWN_DELAY_VOL, not cutoff — when the
@@ -48,6 +49,19 @@
  *     by a uniqueness-checked scan and rewritten with hotpatch() (stop_machine
  *     + I-cache flush) to aim at our own floor. Refused unless each constant
  *     occurs exactly once. "sdv=0" opts out.
+ *   - Pure FVSS: below 3600 mV (3400 cold) the driver derives SOC from filtered
+ *     voltage, but soc_scale_work() vetoes that value whenever the hardware
+ *     msoc sits more than 1% below it and walks the display down 1% per tick
+ *     instead. With the stock graphite profile driving a Si/C cell that veto is
+ *     active for the whole tail, which is what parks the phone at 1% for an
+ *     hour. We hook fg_get_msoc() and, ONLY for the single call that fills
+ *     chip->msoc_actual, hand back prev_soc_scale_msoc -- so the veto's
+ *     difference is exactly zero and the driver's own voltage SOC is reported.
+ *     The field is identified by an exact arithmetic identity the driver just
+ *     computed (vbatt_res == vbatt_avg - cutoff_volt_mv), anchored on the cutoff
+ *     value we ourselves wrote, so again no per-device constant. "fvss=0" opts
+ *     out. Nothing outside FVSS changes: msoc_actual has no other consumer, and
+ *     every other fg_get_msoc() caller passes a stack local we never touch.
  *   - Stock values are restored on unload, including the patched instructions.
  */
 
@@ -113,10 +127,10 @@ static int fmt_msg(char *buf, int size, const char *fmt, ...)
 }
 
 KPM_NAME("battery-fg-cutoff");
-KPM_VERSION("1.6.0");
+KPM_VERSION("1.7.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("battery-fg-fix-kpm");
-KPM_DESCRIPTION("Lower FG-Gen4 cutoff + empty + shutdown floor (lmi / Si-C tier)");
+KPM_DESCRIPTION("FG-Gen4: lower cutoff/empty/shutdown floor + pure-FVSS SOC (Si-C tier)");
 
 /* ------------------------------------------------------------------ */
 /* Tunables (conservative tier)                                        */
@@ -203,6 +217,15 @@ KPM_DESCRIPTION("Lower FG-Gen4 cutoff + empty + shutdown floor (lmi / Si-C tier)
 
 #define SCAN_MAX_BYTES      0x4000 /* 16 KiB, probe_kernel_read-guarded */
 
+/*
+ * Upper bound on how far into the chip object the FVSS scale block can sit.
+ * struct fg_gen4_chip opens with fg + dt (found by the scan above) and the
+ * soc_scale_* / vbatt_* ints come well after a PROFILE_LEN byte array, so this
+ * is deliberately loose -- the identity test below, not this bound, is what
+ * identifies the field. Its only job is to reject stack pointers cheaply.
+ */
+#define MSOC_CHIP_SPAN      0x10000 /* 64 KiB, probe_kernel_read-guarded */
+
 /* FG SRAM parameters (identical for pm8150b v1 and v2 tables) */
 #define CUTOFF_VOLT_WORD    20
 #define CUTOFF_VOLT_BYTE    0
@@ -240,6 +263,7 @@ static fg_sram_write_t     p_fg_sram_write;
 static fg_sram_read_t      p_fg_sram_read;          /* optional: anchor source */
 static void               *p_fg_get_battery_voltage; /* hook target + callable */
 static void               *p_fg_psy_get_property;    /* hook target            */
+static void               *p_fg_get_msoc;             /* hook target            */
 static const void         *p_is_low_temp_flag;      /* driver's own cold verdict */
 
 /* ------------------------------------------------------------------ */
@@ -265,6 +289,13 @@ static unsigned int sdv_orig[2];        /* original words, for restore         *
 static int          sdv_patched;
 static int          sdv_from_arg = -1;  /* -1 unset, 0 disable, >0 explicit mV */
 static insn_patch_text_t p_insn_patch_text;
+
+/* Pure-FVSS state: see after_get_msoc(). */
+static int   fvss_pure = 1;             /* "fvss=0" opts out                    */
+static long  msoc_actual_off = -1;      /* confirmed chip offset of msoc_actual */
+static int   fvss_overrides;            /* how many times we have fed it        */
+static int   fvss_logs_left = 3;        /* first-few-overrides notices          */
+static int   fvss_id_logs_left = 3;     /* identity-test failure notices        */
 
 static int   reassert_logs_left = 3;    /* driver-overwrote-us notices          */
 static int   diag_dumps_left = 3;       /* one-shot memory dumps on scan failure */
@@ -967,6 +998,168 @@ static void after_get_property(hook_fargs3_t *args, void *udata)
 }
 
 /* ------------------------------------------------------------------ */
+/* Hook 3: fg_get_msoc(struct fg_dev *fg, int *msoc) — AFTER hook     */
+/* Stops the hardware msoc from vetoing the FVSS voltage SOC.          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * WHY.
+ *
+ * Below 3600 mV (3400 when the driver says cold) the driver enters FVSS and
+ * stops trusting the gauge's coulomb counter, deriving SOC linearly from
+ * filtered voltage instead:
+ *
+ *     soc = (vbatt_avg - dt.cutoff_volt_mv) / soc_scale_slope
+ *
+ * That is exactly what we want on a Si/C cell, because the profile programmed
+ * into the gauge is still the stock graphite one and its msoc collapses early.
+ * But soc_scale_work() does not report that soc unconditionally. Its first
+ * branch reads:
+ *
+ *     if ((prev_soc_scale_msoc - msoc_actual) > soc_thr_percent)
+ *             soc_scale_msoc = prev_soc_scale_msoc - soc_thr_percent;
+ *
+ * i.e. whenever the voltage-derived SOC sits more than one percent ABOVE the
+ * hardware msoc, throw the voltage away and step down 1% per tick. Feeding a
+ * graphite profile from a Si/C cell keeps that condition true for the entire
+ * tail, so the display is walked down to the gauge's pessimistic msoc and parks
+ * at 1% while the cell still holds a large usable reserve.
+ *
+ * WHAT WE DO.
+ *
+ * chip->msoc_actual has exactly ONE writer -- fg_gen4_validate_soc_scale_mode()
+ * -- and exactly TWO readers: the veto above, and the charging-side FVSS exit
+ * test "msoc_actual >= soc_scale_msoc". Nothing else in the driver touches it.
+ * So handing that one field prev_soc_scale_msoc instead of the hardware value:
+ *
+ *   - makes (prev - msoc_actual) == 0, permanently disabling the veto and
+ *     leaving soc_scale_work()'s remaining branches in charge: report the
+ *     voltage SOC, never let it rise, and rate-limit a fast drop to 1% per
+ *     tick. That IS pure FVSS, with the driver's own smoothing intact.
+ *   - makes the charging exit test true at once, so plugging in leaves FVSS
+ *     immediately. Better than stock, not worse: fg_gen4_exit_soc_scale() calls
+ *     fg_gen4_write_scale_msoc() on the way out, which programs the scaled SOC
+ *     into the hardware MONOTONIC_SOC register, so the displayed value carries
+ *     over seamlessly and then climbs with the charge -- instead of freezing
+ *     until an inaccurate HW msoc catches up to it.
+ *   - changes NOTHING outside FVSS. msoc_actual has no other consumer, and
+ *     every other caller of fg_get_msoc() -- including the one behind
+ *     POWER_SUPPLY_PROP_CAPACITY when FVSS is off -- passes a stack local,
+ *     which the identity test below rejects.
+ *
+ * WHAT IT DOES NOT FIX: the FVSS ENTRY soc still comes from the gauge, because
+ * fg_gen4_enter_soc_scale() seeds soc_scale_msoc from the currently reported
+ * capacity and derives the slope from it. So the tail is now spread evenly from
+ * wherever the gauge thought we were at 3600 mV down to cutoff -- no more early
+ * collapse and no more hour at 1% -- but that entry point is still profile
+ * dependent. Correcting it would mean replacing the battery profile, which is a
+ * different job from moving the floors.
+ */
+
+/*
+ * Is `w` (a window of seven ints centred on the candidate) really the
+ * neighbourhood of chip->msoc_actual?
+ *
+ * struct fg_gen4_chip lays these out consecutively:
+ *
+ *   -3 soc_scale_msoc  -2 prev_soc_scale_msoc  -1 soc_scale_slope
+ *    0 msoc_actual     +1 vbatt_avg  +2 vbatt_now  +3 vbatt_res
+ *
+ * and the one caller that passes us a pointer into the chip object runs
+ * fg_gen4_get_prop_soc_scale() immediately beforehand, which fills those three
+ * voltage words and finishes with
+ *
+ *     vbatt_res = vbatt_avg - dt.cutoff_volt_mv
+ *
+ * That is an exact arithmetic identity between three words we can read,
+ * anchored on the cutoff value THIS MODULE placed in the dt block -- the same
+ * spirit as the SRAM cross-check that locates the dt block itself, and again
+ * with no per-device constant of our own. Note the ordering that makes the
+ * anchor sound: fg_gen4_get_prop_soc_scale() calls fg_get_battery_voltage()
+ * (where hook 1 re-asserts our cutoff) BEFORE it computes vbatt_res, so by the
+ * time the identity is formed our value is the one in the field.
+ *
+ * slope > 0 is only true once fg_gen4_enter_soc_scale() has run, so the field
+ * is confirmed on the first tick where the veto could actually fire -- exactly
+ * when we need it, and never on the basis of a zeroed, never-used struct. A
+ * tick that fails any test simply does not confirm and we try the next one, so
+ * losing a race against another CPU reprogramming the cutoff costs nothing.
+ */
+static int msoc_shape_ok(const int *w, int cutoff_mv)
+{
+    return w[0] >= 0 && w[0] <= 100 &&                 /* soc_scale_msoc      */
+           w[1] >= 0 && w[1] <= 100 &&                 /* prev_soc_scale_msoc */
+           w[2] >  0 && w[2] <= FP_MV_HI &&            /* soc_scale_slope     */
+           w[3] >= 0 && w[3] <= 100 &&                 /* msoc_actual         */
+           w[4] >= FP_MV_LO && w[4] <= FP_MV_HI &&     /* vbatt_avg           */
+           w[5] >= FP_MV_LO && w[5] <= FP_MV_HI &&     /* vbatt_now           */
+           w[6] == w[4] - cutoff_mv;                   /* vbatt_res identity  */
+}
+
+static void after_get_msoc(hook_fargs2_t *args, void *udata)
+{
+    void *chip = (void *)args->arg0;
+    int *dst = (int *)args->arg1;
+    unsigned long off;
+    int w[7];
+
+    if (!fvss_pure || (int)args->ret != 0 || !dst)
+        return;
+
+    /* No located dt block means no cutoff anchor, so no identity test and no
+     * writes. chip_ptr is set by hook 1, which runs constantly. */
+    if (!chip || chip != chip_ptr || !cutoff_field)
+        return;
+
+    off = (unsigned long)((char *)dst - (char *)chip);
+    if (off & (sizeof(int) - 1))
+        return;
+    /* Below the window we need to read, or past the object: a stack local. A
+     * dst < chip wraps the unsigned subtraction and is caught by the bound. */
+    if (off < 3 * sizeof(int) || off + 4 * sizeof(int) > MSOC_CHIP_SPAN)
+        return;
+    /* Once identified, the field never moves; a second in-object address would
+     * mean the identification was wrong, so refuse rather than guess. */
+    if (msoc_actual_off >= 0 && off != (unsigned long)msoc_actual_off)
+        return;
+
+    if (safe_read_ints(dst - 3, w, 7) != 0)
+        return;
+
+    if (!msoc_shape_ok(w, *cutoff_field)) {
+        /* Only interesting once FVSS is running (slope set): before that the
+         * struct is legitimately zeroed and failing is the correct answer. */
+        if (msoc_actual_off < 0 && w[2] > 0 && fvss_id_logs_left > 0) {
+            fvss_id_logs_left--;
+            pr_info(LOG_PREFIX "FVSS: chip+0x%lx failed identity: soc=%d prev=%d slope=%d msoc=%d vavg=%d vnow=%d vres=%d cutoff=%d%s\n",
+                    off, w[0], w[1], w[2], w[3], w[4], w[5], w[6], *cutoff_field,
+                    fvss_id_logs_left ? "" : " (further notices suppressed)");
+        }
+        return;
+    }
+
+    if (msoc_actual_off < 0) {
+        msoc_actual_off = (long)off;
+        pr_info(LOG_PREFIX "FVSS: msoc_actual located @chip+0x%lx; HW msoc no longer vetoes the voltage SOC\n",
+                off);
+    }
+
+    /*
+     * prev_soc_scale_msoc -- the very value soc_scale_work() is about to
+     * subtract this field from, so the veto sees a difference of exactly zero.
+     */
+    *dst = w[1];
+    fvss_overrides++;
+
+    if (fvss_logs_left > 0 && w[3] != w[1]) {
+        fvss_logs_left--;
+        pr_info(LOG_PREFIX "FVSS: HW msoc %d ignored, keeping voltage SOC %d (vbatt avg %d mV)%s\n",
+                w[3], w[1], w[4],
+                fvss_logs_left ? "" : " (further notices suppressed)");
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* KPM lifecycle                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -985,6 +1178,12 @@ static void after_get_property(hook_fargs3_t *args, void *udata)
  *              (0..200, default 100). "lt=0" disables the tier entirely.
  *              WHEN it is cold is the driver's call, not ours -- see
  *              update_low_temp_tier().
+ *
+ * Pure FVSS:
+ *   "fvss=0"   leave the hardware msoc's veto over the FVSS voltage SOC in
+ *              place, i.e. stock behaviour. Default is 1 (veto disabled) --
+ *              see after_get_msoc(). Accepted by KPM_CTL0 too, so the veto can
+ *              be switched back on live without unloading.
  */
 static int kw_is(const char *s, const char *kw)
 {
@@ -1011,6 +1210,17 @@ static void set_targets_from_args(const char *args)
             for (; *s >= '0' && *s <= '9'; s++) { v = v * 10 + (*s - '0'); got = 1; }
             if (got)
                 sdv_from_arg = v;          /* 0 disables the instruction patch */
+            if (!*s)
+                break;
+            continue;
+        }
+        if (kw_is(s, "fvss=")) {
+            int v = 0, got = 0;
+
+            s += 5;
+            for (; *s >= '0' && *s <= '9'; s++) { v = v * 10 + (*s - '0'); got = 1; }
+            if (got)
+                fvss_pure = v ? 1 : 0;
             if (!*s)
                 break;
             continue;
@@ -1076,12 +1286,13 @@ static long fg_cutoff_init(const char *args, const char *event, void *__user res
     p_fg_sram_read           = (fg_sram_read_t)kallsyms_lookup_name("fg_sram_read");
     p_fg_get_battery_voltage = (void *)kallsyms_lookup_name("fg_get_battery_voltage");
     p_fg_psy_get_property    = (void *)kallsyms_lookup_name("fg_psy_get_property");
+    p_fg_get_msoc            = (void *)kallsyms_lookup_name("fg_get_msoc");
     p_is_low_temp_flag       = (const void *)kallsyms_lookup_name("is_low_temp_flag");
     p_insn_patch_text        = (insn_patch_text_t)kallsyms_lookup_name("aarch64_insn_patch_text");
 
-    pr_info(LOG_PREFIX "syms: pkr=%px sram_write=%px sram_read=%px get_voltage=%px get_property=%px\n",
+    pr_info(LOG_PREFIX "syms: pkr=%px sram_write=%px sram_read=%px get_voltage=%px get_property=%px get_msoc=%px\n",
             p_probe_kernel_read, p_fg_sram_write, p_fg_sram_read,
-            p_fg_get_battery_voltage, p_fg_psy_get_property);
+            p_fg_get_battery_voltage, p_fg_psy_get_property, p_fg_get_msoc);
 
     if (!p_probe_kernel_read || !p_fg_get_battery_voltage) {
         pr_err(LOG_PREFIX "missing required symbols; aborting\n");
@@ -1132,14 +1343,43 @@ static long fg_cutoff_init(const char *args, const char *event, void *__user res
         pr_info(LOG_PREFIX "fg_psy_get_property not found; shutdown floor stays stock 3300 mV\n");
     }
 
+    /*
+     * Pure FVSS: optional, and hooked unconditionally so "fvss=" stays live
+     * through KPM_CTL0 -- the gate inside the hook is one compare against the
+     * two SPMI SRAM reads fg_get_msoc() itself does. Without it the floors
+     * still apply, the tail is just still walked down by the gauge's own
+     * pessimistic msoc.
+     */
+    if (p_fg_get_msoc) {
+        err = hook_wrap2(p_fg_get_msoc, 0, after_get_msoc, 0);
+        if (err) {
+            pr_err(LOG_PREFIX "hook_wrap2(get_msoc) failed err=%d; pure FVSS NOT available\n",
+                   err);
+            p_fg_get_msoc = 0;
+        } else {
+            pr_info(LOG_PREFIX "pure FVSS %s; msoc_actual is identified on the first FVSS tick\n",
+                    fvss_pure ? "armed" : "hooked but disabled (fvss=0)");
+        }
+    } else {
+        pr_info(LOG_PREFIX "fg_get_msoc not found; FVSS SOC stays HW-msoc-vetoed\n");
+    }
+
     pr_info(LOG_PREFIX "hooks installed; applying on next FG voltage read\n");
     return 0;
+}
+
+/* "off" | "armed" (hooked, field not yet identified) | "active". */
+static const char *fvss_state_str(void)
+{
+    if (!fvss_pure || !p_fg_get_msoc)
+        return "off";
+    return msoc_actual_off >= 0 ? "active" : "armed";
 }
 
 /* Runtime reconfigure: kpm control battery-fg-cutoff "<cutoff>[,<empty>[,<shutdown>]]" */
 static long fg_cutoff_control0(const char *args, char *__user out_msg, int outlen)
 {
-    char msg[160];
+    char msg[224];
     int len;
 
     set_targets_from_args(args);
@@ -1151,13 +1391,15 @@ static long fg_cutoff_control0(const char *args, char *__user out_msg, int outle
         write_cutoff_sram(chip_ptr, eff_cutoff_mv(), 1);
         write_empty_sram(chip_ptr, eff_empty_mv(), 1);
         len = fmt_msg(msg, (int)sizeof(msg),
-                      "cutoff=%d empty=%d shutdown=%d mV live (stock %d/%d)\n",
+                      "cutoff=%d empty=%d shutdown=%d mV live (stock %d/%d) fvss=%s (%d)\n",
                       eff_cutoff_mv(), eff_empty_mv(), eff_shutdown_mv(),
-                      orig_cutoff_mv, orig_empty_mv);
+                      orig_cutoff_mv, orig_empty_mv, fvss_state_str(),
+                      fvss_overrides);
     } else {
         len = fmt_msg(msg, (int)sizeof(msg),
-                      "cutoff=%d empty=%d shutdown=%d mV queued (not yet located)\n",
-                      eff_cutoff_mv(), eff_empty_mv(), eff_shutdown_mv());
+                      "cutoff=%d empty=%d shutdown=%d mV queued (not yet located) fvss=%s\n",
+                      eff_cutoff_mv(), eff_empty_mv(), eff_shutdown_mv(),
+                      fvss_state_str());
     }
 
     pr_info(LOG_PREFIX "%s", msg);
@@ -1186,6 +1428,8 @@ static long fg_cutoff_exit(void *__user reserved)
 
     restore_shutdown_delay_vol();
 
+    if (p_fg_get_msoc)
+        unhook(p_fg_get_msoc);
     if (p_fg_psy_get_property)
         unhook(p_fg_psy_get_property);
     if (p_fg_get_battery_voltage)
