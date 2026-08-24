@@ -21,6 +21,40 @@ against the value the device itself has programmed into FG SRAM (see
 [How it works](#how-it-works-device-independent)). Different PMIC/driver
 generations (FG-Gen3, QG/QGauge) are **not** supported.
 
+**Note: the defaults suit silicon/carbon-anode cells only — do not load this
+blindly on other packs.**
+After installing the KPM, the recommended routine is: power off, hold
+volume-down + power (yes, the fastboot combo) for a minute to reset the PMIC,
+then boot and use the phone normally down to 1% until the 30-second shutdown
+countdown appears, and charge it back to full in one go. That also recalibrates
+the gauge's SOC computation to some extent (making it as accurate as possible
+before FVSS takes over).
+
+If your cell really is Si/C and these parameters suit it, you should feel the
+low band (the FVSS range, starting somewhere around 20% and running down to 1%)
+draining slower and lasting longer than before.
+
+If the phone starts shutting itself down — black screen, no warning — while it
+still shows a fair amount of charge, say 5% or even 10% or more, then your cell
+is not silicon/carbon and this KPM (with its default parameters) is not right
+for your battery. If you can run it down to a displayed 1% and get the
+30-second countdown, the KPM and its parameters do fit your battery.
+
+Charging in the low band (inside FVSS, especially anywhere from a few percent
+to the mid-teens or twenties) will show an inaccurate percentage: for a while
+the number does not move even though charge really is going in. Charging exits
+FVSS immediately and the percentage falls back to the gauge's SOC, which by
+then may already be very low; the display only starts rising once the gauge SOC
+catches up to the FVSS percentage you were seeing.
+For example: FVSS SOC is 15% and the system shows 15%, but the gauge SOC is
+actually down at 2% or even 0%. You plug in, FVSS is dropped at once and the
+gauge SOC takes over — but a charging percentage can never run backwards, so it
+sits at 15% for quite a while, and only once the gauge SOC catches up to 15%
+does the UI start climbing again.
+Charging itself is completely unaffected (this touches nothing in
+charging/fast-charging — that is managed by an entirely separate stack); only
+the battery percentage (SOC) display is. Just keep that in mind while charging.
+
 ## Why
 
 The stock driver anchors the fuel gauge's **0%** point at "voltage reaches
@@ -602,6 +636,18 @@ GPL-2.0-or-later (matches the Linux kernel and KernelPatch).
 的那几个符号存在且同名。模块内**不写死任何机型相关的值**：它按*结构形状*定位驱动的参数块，
 再用设备自己烧进 FG SRAM 的值来确认（见[工作原理](#工作原理与机型无关)）。
 不同代的 PMIC / 驱动（FG-Gen3、QG/QGauge）**不支持**。
+
+注意：默认的参数仅适用硅碳负极电池，其它电池别瞎上。
+建议安装这个KPM后，关机，然后长按音量减+电源键（没错就是进fastboot那个组合键）一分钟来重置PMIC，然后开机正常使用，用到1%然后弹出30秒倒计时关机，再一口气充满电，这样一定程度上也可以校准电量计的SOC计算（尽可能让它在进FVSS之前更准一些）。
+
+如果你的电池是硅碳负极，合适这个参数的话，你应该能感觉到低段电量（即FVSS的区间，可能大概从20%左右开始，到1%）比之前掉得更慢，更耐用了。
+
+如果你发现装了这个模块以后，在还有较多电量百分比，比如5% 甚至10%或更多，就直接黑屏自动关机了，那说明你的电池不是硅碳电池，这个KPM（的默认参数）不适合你的电池。
+如果你能用到显示1%电量然后弹出30秒倒计时关机，说明这个KPM以及参数是合适你的电池的。
+
+在低电量段（FVSS，特别是百分之几到十几二十这样）充电，会出现电量显示不准的情况，具体表现为充了一段时间电量百分比显示不会涨，实际上是充进去了的。是因为充电会立马退出FVSS，百分比采用电量计的SOC，然而这时候电量计SOC可能已经很低了，得充到此刻FVSS电量的SOC，电量显示才会涨。
+举个例子，此时FVSS SOC为15%，系统显示15%，但是电量计SOC其实已经只有2%甚至0%了，这时你充电，立马退出FVSS采用电量计的SOC显示，但是充电中百分比显示不可能倒着跑，所以会相当一段时间显示15%，只有等电量计的SOC追上15%了，你才能看到UI显示的SOC往上涨。
+充电是完全没问题的（这个完全不动充电/快充，充电是由另一套东西管理的），只影响电量百分比（SOC）的显示。充的时候自己心里有数就行。
 
 ## 为什么
 
